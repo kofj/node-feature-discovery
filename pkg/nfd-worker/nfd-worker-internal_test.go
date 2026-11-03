@@ -17,18 +17,19 @@ limitations under the License.
 package nfdworker
 
 import (
+	"bytes"
+	"context"
 	"os"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
 	"time"
 
 	. "github.com/smartystreets/goconvey/convey"
-	"github.com/stretchr/testify/mock"
 	"github.com/vektra/errors"
-
-	"sigs.k8s.io/node-feature-discovery/pkg/labeler"
+	fakeclient "k8s.io/client-go/kubernetes/fake"
+	"k8s.io/klog/v2"
+	nfdv1alpha1 "sigs.k8s.io/node-feature-discovery/api/nfd/v1alpha1"
 	"sigs.k8s.io/node-feature-discovery/pkg/utils"
 	"sigs.k8s.io/node-feature-discovery/source"
 	"sigs.k8s.io/node-feature-discovery/source/cpu"
@@ -37,6 +38,44 @@ import (
 )
 
 const fakeLabelSourceName string = "testSource"
+
+func TestDeprecatedNoOwnerRefsWarning(t *testing.T) {
+	state := klog.CaptureState()
+	defer state.Restore()
+	klog.LogToStderr(false)
+
+	testCases := []struct {
+		name      string
+		args      *Args
+		overrides string
+	}{
+		{name: "configuration option", args: &Args{}, overrides: `{"core":{"noOwnerRefs":true}}`},
+		{name: "command-line flag", args: &Args{Overrides: ConfigOverrideArgs{NoOwnerRefs: new(true)}}},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			var output bytes.Buffer
+			klog.SetOutput(&output)
+
+			w, err := NewNfdWorker(
+				WithArgs(tc.args),
+				WithKubernetesClient(fakeclient.NewClientset()),
+			)
+			if err != nil {
+				t.Fatalf("NewNfdWorker() returned error: %v", err)
+			}
+			worker := w.(*nfdWorker)
+			if err := worker.configure(context.Background(), "", tc.overrides); err != nil {
+				t.Fatalf("configure() returned error: %v", err)
+			}
+			klog.Flush()
+
+			if !strings.Contains(output.String(), "deprecated 'core.noOwnerRefs'") {
+				t.Fatalf("deprecation warning was not logged; output: %s", output.String())
+			}
+		})
+	}
+}
 
 func TestGetLabelsWithMockSources(t *testing.T) {
 	Convey("When I discover features from fake source and update the node using fake client", t, func() {
@@ -55,7 +94,7 @@ func TestGetLabelsWithMockSources(t *testing.T) {
 			mockLabelSource.On("Name").Return(fakeLabelSourceName)
 			mockLabelSource.On("GetLabels").Return(fakeFeatures, nil)
 
-			returnedLabels, err := getFeatureLabels(fakeLabelSource, labelWhiteList.Regexp)
+			returnedLabels, err := GetFeatureLabels(fakeLabelSource, labelWhiteList.Regexp)
 			Convey("Proper label is returned", func() {
 				So(returnedLabels, ShouldResemble, fakeFeatureLabels)
 			})
@@ -68,7 +107,7 @@ func TestGetLabelsWithMockSources(t *testing.T) {
 			expectedError := errors.New("fake error")
 			mockLabelSource.On("GetLabels").Return(nil, expectedError)
 
-			returnedLabels, err := getFeatureLabels(fakeLabelSource, labelWhiteList.Regexp)
+			returnedLabels, err := GetFeatureLabels(fakeLabelSource, labelWhiteList.Regexp)
 			Convey("No label is returned", func() {
 				So(returnedLabels, ShouldBeNil)
 			})
@@ -84,7 +123,7 @@ func makeFakeFeatures(names []string) (source.FeatureLabels, Labels) {
 	labels := Labels{}
 	for _, f := range names {
 		features[f] = true
-		labelName := fakeLabelSourceName + "-" + f
+		labelName := nfdv1alpha1.FeatureLabelNs + "/" + fakeLabelSourceName + "-" + f
 		if strings.IndexByte(f, '/') >= 0 {
 			labelName = f
 		}
@@ -96,25 +135,29 @@ func makeFakeFeatures(names []string) (source.FeatureLabels, Labels) {
 
 func TestConfigParse(t *testing.T) {
 	Convey("When parsing configuration", t, func() {
-		w, err := NewNfdWorker(&Args{})
+		k8sCli := fakeclient.NewClientset()
+		w, err := NewNfdWorker(WithArgs(&Args{}),
+			WithKubernetesClient(k8sCli))
 		So(err, ShouldBeNil)
 		worker := w.(*nfdWorker)
-		overrides := `{"core": {"labelSources": ["fake"],"noPublish": true},"sources": {"cpu": {"cpuid": {"attributeBlacklist": ["foo","bar"]}}}}`
+		overrides := `{"core": {"labelSources": ["fake"],"noPublish": true,"ownerRefs": []},"sources": {"cpu": {"cpuid": {"attributeBlacklist": ["foo","bar"]}}}}`
 
 		Convey("and no core cmdline flags have been specified", func() {
-			So(worker.configure("non-existing-file", overrides), ShouldBeNil)
+			So(worker.configure(context.Background(), "non-existing-file", overrides), ShouldBeNil)
 
 			Convey("core overrides should be in effect", func() {
 				So(worker.config.Core.LabelSources, ShouldResemble, []string{"fake"})
 				So(worker.config.Core.FeatureSources, ShouldResemble, []string{"all"})
 				So(worker.config.Core.NoPublish, ShouldBeTrue)
+				So(worker.config.Core.OwnerRefs, ShouldNotBeNil)
+				So(*worker.config.Core.OwnerRefs, ShouldBeEmpty)
 			})
 		})
 		Convey("and a non-accessible file, but core cmdline flags and some overrides are specified", func() {
 			worker.args = Args{Overrides: ConfigOverrideArgs{
 				LabelSources:   &utils.StringSliceVal{"cpu", "kernel", "pci"},
 				FeatureSources: &utils.StringSliceVal{"cpu"}}}
-			So(worker.configure("non-existing-file", overrides), ShouldBeNil)
+			So(worker.configure(context.Background(), "non-existing-file", overrides), ShouldBeNil)
 
 			Convey("core cmdline flags should be in effect instead overrides", func() {
 				So(worker.config.Core.LabelSources, ShouldResemble, []string{"cpu", "kernel", "pci"})
@@ -129,7 +172,11 @@ func TestConfigParse(t *testing.T) {
 		})
 		// Create a temporary config file
 		f, err := os.CreateTemp("", "nfd-test-")
-		defer os.Remove(f.Name())
+		defer func() {
+			if err := os.Remove(f.Name()); err != nil {
+				t.Errorf("failed to remove temp file %s: %v", f.Name(), err)
+			}
+		}()
 		So(err, ShouldBeNil)
 		_, err = f.WriteString(`
 core:
@@ -145,12 +192,13 @@ sources:
   pci:
     deviceClassWhitelist:
       - "ff"`)
-		f.Close()
+		So(err, ShouldBeNil)
+		err = f.Close()
 		So(err, ShouldBeNil)
 
 		Convey("and a proper config file is specified", func() {
 			worker.args = Args{Overrides: ConfigOverrideArgs{LabelSources: &utils.StringSliceVal{"cpu", "kernel", "pci"}}}
-			So(worker.configure(f.Name(), ""), ShouldBeNil)
+			So(worker.configure(context.Background(), f.Name(), ""), ShouldBeNil)
 
 			Convey("specified configuration should take effect", func() {
 				// Verify core config
@@ -172,7 +220,7 @@ sources:
 		Convey("and a proper config file and overrides are given", func() {
 			worker.args = Args{Overrides: ConfigOverrideArgs{FeatureSources: &utils.StringSliceVal{"cpu"}}}
 			overrides := `{"core": {"labelSources": ["fake"],"noPublish": true},"sources": {"pci": {"deviceClassWhitelist": ["03"]}}}`
-			So(worker.configure(f.Name(), overrides), ShouldBeNil)
+			So(worker.configure(context.Background(), f.Name(), overrides), ShouldBeNil)
 
 			Convey("overrides should take precedence over the config file", func() {
 				// Verify core config
@@ -192,113 +240,6 @@ sources:
 	})
 }
 
-func TestDynamicConfig(t *testing.T) {
-	Convey("When running nfd-worker", t, func() {
-		tmpDir, err := os.MkdirTemp("", "*.nfd-test")
-		So(err, ShouldBeNil)
-		defer os.RemoveAll(tmpDir)
-
-		// Create (temporary) dir for config
-		configDir := filepath.Join(tmpDir, "subdir-1", "subdir-2", "worker.conf")
-		err = os.MkdirAll(configDir, 0755)
-		So(err, ShouldBeNil)
-
-		// Create config file
-		configFile := filepath.Join(configDir, "worker.conf")
-
-		writeConfig := func(data string) {
-			f, err := os.Create(configFile)
-			So(err, ShouldBeNil)
-			_, err = f.WriteString(data)
-			So(err, ShouldBeNil)
-			err = f.Close()
-			So(err, ShouldBeNil)
-
-		}
-		writeConfig(`
-core:
-  labelWhiteList: "fake"
-`)
-
-		noPublish := true
-		w, err := NewNfdWorker(&Args{
-			ConfigFile: configFile,
-			Overrides: ConfigOverrideArgs{
-				FeatureSources: &utils.StringSliceVal{"fake"},
-				LabelSources:   &utils.StringSliceVal{"fake"},
-				NoPublish:      &noPublish},
-		})
-		So(err, ShouldBeNil)
-		worker := w.(*nfdWorker)
-
-		Convey("config file updates should take effect", func() {
-			go func() { _ = w.Run() }()
-			defer w.Stop()
-
-			// Check initial config
-			So(func() interface{} { return worker.config.Core.LabelWhiteList.String() },
-				withTimeout, 2*time.Second, ShouldEqual, "fake")
-
-			// Update config and verify the effect
-			writeConfig(`
-core:
-  labelWhiteList: "foo"
-`)
-			So(func() interface{} { return worker.config.Core.LabelWhiteList.String() },
-				withTimeout, 2*time.Second, ShouldEqual, "foo")
-
-			// Removing config file should get back our defaults
-			err = os.RemoveAll(tmpDir)
-			So(err, ShouldBeNil)
-			So(func() interface{} { return worker.config.Core.LabelWhiteList.String() },
-				withTimeout, 2*time.Second, ShouldEqual, "")
-
-			// Re-creating config dir and file should change the config
-			err = os.MkdirAll(configDir, 0755)
-			So(err, ShouldBeNil)
-			writeConfig(`
-core:
-  labelWhiteList: "bar"
-`)
-			So(func() interface{} { return worker.config.Core.LabelWhiteList.String() },
-				withTimeout, 2*time.Second, ShouldEqual, "bar")
-		})
-	})
-}
-
-// withTimeout is a custom assertion for polling a value asynchronously
-// actual is a function for getting the actual value
-// expected[0] is a time.Duration value specifying the timeout
-// expected[1] is  the "real" assertion function to be called
-// expected[2:] are the arguments for the "real" assertion function
-func withTimeout(actual interface{}, expected ...interface{}) string {
-	getter, ok := actual.(func() interface{})
-	if !ok {
-		return "not getterFunc"
-	}
-	t, ok := expected[0].(time.Duration)
-	if !ok {
-		return "not time.Duration"
-	}
-	f, ok := expected[1].(func(interface{}, ...interface{}) string)
-	if !ok {
-		return "not an assert func"
-	}
-
-	timeout := time.After(t)
-	for {
-		result := f(getter(), expected[2:]...)
-		if result == "" {
-			return ""
-		}
-		select {
-		case <-timeout:
-			return result
-		case <-time.After(10 * time.Millisecond):
-		}
-	}
-}
-
 func TestNewNfdWorker(t *testing.T) {
 	Convey("When creating new NfdWorker instance", t, func() {
 
@@ -306,12 +247,14 @@ func TestNewNfdWorker(t *testing.T) {
 
 		Convey("without any args specified", func() {
 			args := &Args{}
-			w, err := NewNfdWorker(args)
+			k8sCli := fakeclient.NewClientset()
+			w, err := NewNfdWorker(WithArgs(args),
+				WithKubernetesClient(k8sCli))
 			Convey("no error should be returned", func() {
 				So(err, ShouldBeNil)
 			})
 			worker := w.(*nfdWorker)
-			So(worker.configure("", ""), ShouldBeNil)
+			So(worker.configure(context.Background(), "", ""), ShouldBeNil)
 			Convey("all sources should be enabled and the whitelist regexp should be empty", func() {
 				So(len(worker.featureSources), ShouldEqual, len(source.GetAllFeatureSources())-1)
 				So(len(worker.labelSources), ShouldEqual, len(source.GetAllLabelSources())-1)
@@ -323,12 +266,14 @@ func TestNewNfdWorker(t *testing.T) {
 			args := &Args{Overrides: ConfigOverrideArgs{
 				LabelSources:   &utils.StringSliceVal{"fake"},
 				FeatureSources: &utils.StringSliceVal{"cpu"}}}
-			w, err := NewNfdWorker(args)
+			k8sCli := fakeclient.NewClientset()
+			w, err := NewNfdWorker(WithArgs(args),
+				WithKubernetesClient(k8sCli))
 			Convey("no error should be returned", func() {
 				So(err, ShouldBeNil)
 			})
 			worker := w.(*nfdWorker)
-			So(worker.configure("", ""), ShouldBeNil)
+			So(worker.configure(context.Background(), "", ""), ShouldBeNil)
 			Convey("proper sources should be enabled", func() {
 				So(len(worker.featureSources), ShouldEqual, 1)
 				So(worker.featureSources[0].Name(), ShouldEqual, "cpu")
@@ -352,9 +297,9 @@ func TestCreateFeatureLabels(t *testing.T) {
 
 			Convey("Proper fake labels are returned", func() {
 				So(len(labels), ShouldEqual, 3)
-				So(labels, ShouldContainKey, "fake-fakefeature1")
-				So(labels, ShouldContainKey, "fake-fakefeature2")
-				So(labels, ShouldContainKey, "fake-fakefeature3")
+				So(labels, ShouldContainKey, nfdv1alpha1.FeatureLabelNs+"/"+"fake-fakefeature1")
+				So(labels, ShouldContainKey, nfdv1alpha1.FeatureLabelNs+"/"+"fake-fakefeature2")
+				So(labels, ShouldContainKey, nfdv1alpha1.FeatureLabelNs+"/"+"fake-fakefeature3")
 			})
 		})
 		Convey("When fake feature source is configured with a whitelist that doesn't match", func() {
@@ -370,31 +315,66 @@ func TestCreateFeatureLabels(t *testing.T) {
 	})
 }
 
-func TestAdvertiseFeatureLabels(t *testing.T) {
-	Convey("When advertising labels", t, func() {
-		w, err := NewNfdWorker(&Args{})
-		So(err, ShouldBeNil)
-		worker := w.(*nfdWorker)
+func TestRemoveNoPublishFeatures(t *testing.T) {
+	Convey("When stripping features that should not be published", t, func() {
+		newFeatures := func() *nfdv1alpha1.Features {
+			f := nfdv1alpha1.NewFeatures()
+			f.Flags["cpu.cpuid"] = nfdv1alpha1.NewFlagFeatures("AVX", "SSE")
+			f.Attributes["cpu.model"] = nfdv1alpha1.NewAttributeFeatures(map[string]string{"family": "23"})
+			f.Attributes["system.osrelease"] = nfdv1alpha1.NewAttributeFeatures(map[string]string{"ID": "rocky"})
+			f.Instances["pci.device"] = nfdv1alpha1.NewInstanceFeatures(
+				nfdv1alpha1.InstanceFeature{Attributes: map[string]string{"vendor": "10de"}})
+			return f
+		}
 
-		mockClient := &labeler.MockLabelerClient{}
-		worker.grpcClient = mockClient
-
-		labels := map[string]string{"feature-1": "value-1"}
-
-		Convey("Correct labeling request is sent", func() {
-			mockClient.On("SetLabels", mock.AnythingOfType("*context.timerCtx"), mock.AnythingOfType("*labeler.SetLabelsRequest")).Return(&labeler.SetLabelsReply{}, nil)
-			err := worker.advertiseFeatureLabels(labels)
-			Convey("There should be no error", func() {
-				So(err, ShouldBeNil)
-			})
+		Convey("a nil/empty pattern list leaves the features untouched", func() {
+			f := newFeatures()
+			So(removeNoPublishFeatures(f, nil), ShouldBeEmpty)
+			So(len(f.Flags), ShouldEqual, 1)
+			So(len(f.Attributes), ShouldEqual, 2)
+			So(len(f.Instances), ShouldEqual, 1)
 		})
-		Convey("Labeling request fails", func() {
-			mockErr := errors.New("mock-error")
-			mockClient.On("SetLabels", mock.AnythingOfType("*context.timerCtx"), mock.AnythingOfType("*labeler.SetLabelsRequest")).Return(&labeler.SetLabelsReply{}, mockErr)
-			err := worker.advertiseFeatureLabels(labels)
-			Convey("An error should be returned", func() {
-				So(err, ShouldEqual, mockErr)
-			})
+
+		Convey("an exact key match removes only that feature", func() {
+			f := newFeatures()
+			So(removeNoPublishFeatures(f, []string{"pci.device"}), ShouldBeEmpty)
+			So(f.Instances, ShouldNotContainKey, "pci.device")
+			So(len(f.Flags), ShouldEqual, 1)
+			So(len(f.Attributes), ShouldEqual, 2)
+		})
+
+		Convey("a '*' suffix removes all features of a source by prefix", func() {
+			f := newFeatures()
+			So(removeNoPublishFeatures(f, []string{"cpu.*"}), ShouldBeEmpty)
+			So(len(f.Flags), ShouldEqual, 0)
+			So(f.Attributes, ShouldNotContainKey, "cpu.model")
+			So(f.Attributes, ShouldContainKey, "system.osrelease")
+			So(len(f.Instances), ShouldEqual, 1)
+		})
+
+		Convey("multiple patterns are all applied", func() {
+			f := newFeatures()
+			So(removeNoPublishFeatures(f, []string{"pci.device", "cpu.cpuid"}), ShouldBeEmpty)
+			So(len(f.Flags), ShouldEqual, 0)
+			So(len(f.Instances), ShouldEqual, 0)
+			So(len(f.Attributes), ShouldEqual, 2)
+		})
+
+		Convey("a non-matching pattern removes nothing and is reported", func() {
+			f := newFeatures()
+			unmatched := removeNoPublishFeatures(f, []string{"usb.device", "memory.*"})
+			So(unmatched, ShouldResemble, []string{"usb.device", "memory.*"})
+			So(len(f.Flags), ShouldEqual, 1)
+			So(len(f.Attributes), ShouldEqual, 2)
+			So(len(f.Instances), ShouldEqual, 1)
+		})
+
+		Convey("only the non-matching patterns are reported, in config order", func() {
+			f := newFeatures()
+			unmatched := removeNoPublishFeatures(f, []string{"pci.device", "usb.*", "cpu.cpuid"})
+			So(unmatched, ShouldResemble, []string{"usb.*"})
+			So(f.Instances, ShouldNotContainKey, "pci.device")
+			So(f.Flags, ShouldNotContainKey, "cpu.cpuid")
 		})
 	})
 }

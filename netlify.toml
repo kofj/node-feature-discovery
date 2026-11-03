@@ -1,4 +1,13 @@
 # Netlify settings
 [build]
-    command = "cd docs/ && bundle install && jekyll build"
+    command = "cd docs/ && bundle install && bundle exec jekyll build"
     publish = "docs/_site/"
+
+[build.environment]
+    PAGES_DISABLE_NETWORK = "1"
+
+[[redirects]]
+    from = "https://nfd.sigs.k8s.io/*"
+    to = "https://release-0-19--kubernetes-sigs-nfd.netlify.app/:splat"
+    status = 301
+    force = true

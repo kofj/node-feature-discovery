@@ -17,49 +17,23 @@ limitations under the License.
 package custom
 
 import (
-	"encoding/json"
 	"fmt"
-	"reflect"
-	"strings"
+	"os"
 
 	"k8s.io/klog/v2"
-	"sigs.k8s.io/yaml"
 
-	nfdv1alpha1 "sigs.k8s.io/node-feature-discovery/pkg/apis/nfd/v1alpha1"
+	nfdv1alpha1 "sigs.k8s.io/node-feature-discovery/api/nfd/v1alpha1"
+	nodefeaturerule "sigs.k8s.io/node-feature-discovery/pkg/apis/nfd/nodefeaturerule"
 	"sigs.k8s.io/node-feature-discovery/pkg/utils"
 	"sigs.k8s.io/node-feature-discovery/source"
-	"sigs.k8s.io/node-feature-discovery/source/custom/rules"
+	api "sigs.k8s.io/node-feature-discovery/source/custom/api"
 )
 
 // Name of this feature source
 const Name = "custom"
 
-// LegacyMatcher contains the legacy custom rules.
-type LegacyMatcher struct {
-	PciID      *rules.PciIDRule      `json:"pciId,omitempty"`
-	UsbID      *rules.UsbIDRule      `json:"usbId,omitempty"`
-	LoadedKMod *rules.LoadedKModRule `json:"loadedKMod,omitempty"`
-	CpuID      *rules.CpuIDRule      `json:"cpuId,omitempty"`
-	Kconfig    *rules.KconfigRule    `json:"kConfig,omitempty"`
-	Nodename   *rules.NodenameRule   `json:"nodename,omitempty"`
-}
-
-type LegacyRule struct {
-	Name    string          `json:"name"`
-	Value   *string         `json:"value,omitempty"`
-	MatchOn []LegacyMatcher `json:"matchOn"`
-}
-
-type Rule struct {
-	nfdv1alpha1.Rule
-}
-
-type config []CustomRule
-
-type CustomRule struct {
-	*LegacyRule
-	*Rule
-}
+// The config files use the internal API type.
+type config []api.Rule
 
 // newDefaultConfig returns a new config with pre-populated defaults
 func newDefaultConfig() *config {
@@ -69,17 +43,19 @@ func newDefaultConfig() *config {
 // customSource implements the LabelSource and ConfigurableSource interfaces.
 type customSource struct {
 	config *config
-}
-
-type legacyRule interface {
-	Match() (bool, error)
+	// The rules are stored in the NFD API format that is a superset of our
+	// internal API and provides the functions for rule matching.
+	rules []nfdv1alpha1.Rule
 }
 
 // Singleton source instance
 var (
-	src                           = customSource{config: newDefaultConfig()}
-	_   source.LabelSource        = &src
-	_   source.ConfigurableSource = &src
+	src = customSource{
+		config: &config{},
+		rules:  []nfdv1alpha1.Rule{},
+	}
+	_ source.LabelSource        = &src
+	_ source.ConfigurableSource = &src
 )
 
 // Name returns the name of the feature source
@@ -95,6 +71,8 @@ func (s *customSource) GetConfig() source.Config { return s.config }
 func (s *customSource) SetConfig(conf source.Config) {
 	switch v := conf.(type) {
 	case *config:
+		r := []api.Rule(*v)
+		s.rules = convertInternalRulesToNfdApi(&r)
 		s.config = v
 	default:
 		panic(fmt.Sprintf("invalid config type: %T", conf))
@@ -110,12 +88,12 @@ func (s *customSource) GetLabels() (source.FeatureLabels, error) {
 	features := source.GetAllFeatures()
 
 	labels := source.FeatureLabels{}
-	allFeatureConfig := append(getStaticFeatureConfig(), *s.config...)
-	allFeatureConfig = append(allFeatureConfig, getDirectoryFeatureConfig()...)
+	allFeatureConfig := append(getStaticRules(), s.rules...)
+	allFeatureConfig = append(allFeatureConfig, getDropinDirRules()...)
 	klog.V(2).InfoS("resolving custom features", "configuration", utils.DelayedDumper(allFeatureConfig))
 	// Iterate over features
 	for _, rule := range allFeatureConfig {
-		ruleOut, err := rule.execute(features)
+		ruleOut, err := nodefeaturerule.Execute(&rule, features, true)
 		if err != nil {
 			klog.ErrorS(err, "failed to execute rule")
 			continue
@@ -132,110 +110,15 @@ func (s *customSource) GetLabels() (source.FeatureLabels, error) {
 	return labels, nil
 }
 
-func (r *CustomRule) execute(features *nfdv1alpha1.Features) (nfdv1alpha1.RuleOutput, error) {
-	if r.LegacyRule != nil {
-		klog.InfoS("legacy 'matchOn' rule format is deprecated, please convert to the new 'matchFeatures' rule format", "ruleName", r.LegacyRule.Name)
-		ruleOut, err := r.LegacyRule.execute()
-		if err != nil {
-			return nfdv1alpha1.RuleOutput{}, fmt.Errorf("failed to execute legacy rule %s: %w", r.LegacyRule.Name, err)
-		}
-		return nfdv1alpha1.RuleOutput{Labels: ruleOut}, nil
-	}
-
-	if r.Rule != nil {
-		ruleOut, err := r.Rule.Execute(features)
-		if err != nil {
-			return ruleOut, fmt.Errorf("failed to execute rule %s: %w", r.Rule.Name, err)
-		}
-		return ruleOut, nil
-	}
-
-	return nfdv1alpha1.RuleOutput{}, fmt.Errorf("BUG: an empty rule, this really should not happen")
-}
-
-func (r *LegacyRule) execute() (map[string]string, error) {
-	if len(r.MatchOn) > 0 {
-		// Logical OR over the legacy rules
-		matched := false
-		for _, matcher := range r.MatchOn {
-			if m, err := matcher.match(); err != nil {
-				return nil, err
-			} else if m {
-				matched = true
-				break
-			}
-		}
-		if !matched {
-			return nil, nil
+func convertInternalRulesToNfdApi(in *[]api.Rule) []nfdv1alpha1.Rule {
+	out := make([]nfdv1alpha1.Rule, len(*in))
+	for i := range *in {
+		if err := api.ConvertRuleToV1alpha1(&(*in)[i], &out[i]); err != nil {
+			klog.ErrorS(err, "FATAL: API conversion failed")
+			os.Exit(255)
 		}
 	}
-
-	// Prefix non-namespaced labels with "custom-"
-	name := r.Name
-	if !strings.Contains(name, "/") {
-		name = "custom-" + name
-	}
-
-	value := "true"
-	if r.Value != nil {
-		value = *r.Value
-	}
-
-	return map[string]string{name: value}, nil
-}
-
-func (m *LegacyMatcher) match() (bool, error) {
-	allRules := []legacyRule{
-		m.PciID,
-		m.UsbID,
-		m.LoadedKMod,
-		m.CpuID,
-		m.Kconfig,
-		m.Nodename,
-	}
-
-	// return true, nil if all rules match
-	matchRules := func(rules []legacyRule) (bool, error) {
-		for _, rule := range rules {
-			if reflect.ValueOf(rule).IsNil() {
-				continue
-			}
-			if match, err := rule.Match(); err != nil {
-				return false, err
-			} else if !match {
-				return false, nil
-			}
-		}
-		return true, nil
-	}
-
-	return matchRules(allRules)
-}
-
-// UnmarshalJSON implements the Unmarshaler interface from "encoding/json"
-func (c *CustomRule) UnmarshalJSON(data []byte) error {
-	// Do a raw parse to determine if this is a legacy rule
-	raw := map[string]json.RawMessage{}
-	err := yaml.Unmarshal(data, &raw)
-	if err != nil {
-		return err
-	}
-
-	for k := range raw {
-		if strings.ToLower(k) == "matchon" {
-			return yaml.Unmarshal(data, &c.LegacyRule)
-		}
-	}
-
-	return yaml.Unmarshal(data, &c.Rule)
-}
-
-// MarshalJSON implements the Marshaler interface from "encoding/json"
-func (c *CustomRule) MarshalJSON() ([]byte, error) {
-	if c.LegacyRule != nil {
-		return json.Marshal(c.LegacyRule)
-	}
-	return json.Marshal(c.Rule)
+	return out
 }
 
 func init() {

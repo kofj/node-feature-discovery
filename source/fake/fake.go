@@ -20,7 +20,7 @@ import (
 	"fmt"
 
 	"k8s.io/klog/v2"
-	nfdv1alpha1 "sigs.k8s.io/node-feature-discovery/pkg/apis/nfd/v1alpha1"
+	nfdv1alpha1 "sigs.k8s.io/node-feature-discovery/api/nfd/v1alpha1"
 	"sigs.k8s.io/node-feature-discovery/pkg/utils"
 	"sigs.k8s.io/node-feature-discovery/source"
 )
@@ -62,20 +62,20 @@ func newDefaultConfig() *Config {
 			"attr_3": "10",
 		},
 		InstanceFeatures: []FakeInstance{
-			FakeInstance{
+			{
 				"name":   "instance_1",
 				"attr_1": "true",
 				"attr_2": "false",
 				"attr_3": "10",
 				"attr_4": "foobar",
 			},
-			FakeInstance{
+			{
 				"name":   "instance_2",
 				"attr_1": "true",
 				"attr_2": "true",
 				"attr_3": "100",
 			},
-			FakeInstance{
+			{
 				"name": "instance_3",
 			},
 		},
@@ -126,7 +126,7 @@ func (s *fakeSource) Discover() error {
 	for i, instanceAttributes := range s.config.InstanceFeatures {
 		instances[i] = *nfdv1alpha1.NewInstanceFeature(instanceAttributes)
 	}
-	s.features.Instances[InstanceFeature] = nfdv1alpha1.NewInstanceFeatures(instances)
+	s.features.Instances[InstanceFeature] = nfdv1alpha1.NewInstanceFeatures(instances...)
 
 	klog.V(3).InfoS("discovered features", "featureSource", s.Name(), "features", utils.DelayedDumper(s.features))
 

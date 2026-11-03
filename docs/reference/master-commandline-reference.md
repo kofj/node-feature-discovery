@@ -30,36 +30,40 @@ Print usage and exit.
 
 Print version and exit.
 
+### -feature-gates
+
+The `-feature-gates` flag is used to enable or disable non GA features.
+The list of available feature gates can be found in the [feature gates documentation](feature-gates.md).
+
+Example:
+
+```bash
+nfd-master -feature-gates NodeFeatureGroupAPI=true
+```
+
 ### -prune
 
 The `-prune` flag is a sub-command like option for cleaning up the cluster. It
-causes nfd-master to remove all NFD related labels, annotations and extended
-resources from all Node objects of the cluster and exit.
+causes nfd-master to remove all NFD related labels, annotations, extended
+resources and taints from all Node objects of the cluster and exit. Pruning is
+skipped if `-no-publish` (or the `noPublish` configuration option) is set.
+
+> **NOTE:** Currently, if NFD taints are enabled, the first `nfd-master -prune`
+> run may exit with `failed to patch the node` and leave the NFD taints on the
+> node. Run it again. The Helm post-delete hook and the prune kustomize overlay
+> run prune as a Job, which retries automatically.
 
 ### -port
 
-The `-port` flag specifies the TCP port that nfd-master listens for incoming requests.
+The `-port` flag specifies the port on which metrics and healthz endpoints are
+served on.
 
 Default: 8080
 
 Example:
 
 ```bash
-nfd-master -port=443
-```
-
-### -metrics
-
-The `-metrics` flag specifies the port on which to expose
-[Prometheus](https://prometheus.io/) metrics. Setting this to 0 disables the
-metrics server on nfd-master.
-
-Default: 8081
-
-Example:
-
-```bash
-nfd-master -metrics=12345
+nfd-master -port=12345
 ```
 
 ### -instance
@@ -70,6 +74,12 @@ that each of them can store metadata independently. The instance name must
 start and end with an alphanumeric character and may only contain alphanumeric
 characters, `-`, `_` or `.`.
 
+The instance name is added as a prefix to the feature-labels,
+feature-annotations and extended-resources annotations (for example
+`network.nfd.node.kubernetes.io/feature-labels`). The
+`nfd.node.kubernetes.io/taints` annotation does not get the prefix and is not
+separated between deployments.
+
 Default: *empty*
 
 Example:
@@ -78,121 +88,16 @@ Example:
 nfd-master -instance=network
 ```
 
-### -ca-file
-
-> **NOTE** the gRPC API is deprecated and will be removed in a future release.
-> and this flag will be removed as well.
-
-The `-ca-file` is one of the three flags (together with `-cert-file` and
-`-key-file`) controlling master-worker mutual TLS authentication on the
-nfd-master side. This flag specifies the TLS root certificate that is used for
-authenticating incoming connections. NFD-Worker side needs to have matching key
-and cert files configured in order for the incoming requests to be accepted.
-
-Default: *empty*
-
-> **NOTE:** Must be specified together with `-cert-file` and `-key-file`
-
-Example:
-
-```bash
-nfd-master -ca-file=/opt/nfd/ca.crt -cert-file=/opt/nfd/master.crt -key-file=/opt/nfd/master.key
-```
-
-### -cert-file
-
-> **NOTE** the gRPC API is deprecated and will be removed in a future release.
-> and this flag will be removed as well.
-
-The `-cert-file` is one of the three flags (together with `-ca-file` and
-`-key-file`) controlling master-worker mutual TLS authentication on the
-nfd-master side. This flag specifies the TLS certificate presented for
-authenticating outgoing traffic towards nfd-worker.
-
-Default: *empty*
-
-> **NOTE:** Must be specified together with `-ca-file` and `-key-file`
-
-Example:
-
-```bash
-nfd-master -cert-file=/opt/nfd/master.crt -key-file=/opt/nfd/master.key -ca-file=/opt/nfd/ca.crt
-```
-
-### -key-file
-
-> **NOTE** the gRPC API is deprecated and will be removed in a future release.
-> and this flag will be removed as well.
-
-The `-key-file` is one of the three flags (together with `-ca-file` and
-`-cert-file`) controlling master-worker mutual TLS authentication on the
-nfd-master side. This flag specifies the private key corresponding the given
-certificate file (`-cert-file`) that is used for authenticating outgoing
-traffic.
-
-Default: *empty*
-
-> **NOTE:** Must be specified together with `-cert-file` and `-ca-file`
-
-Example:
-
-```bash
-nfd-master -key-file=/opt/nfd/master.key -cert-file=/opt/nfd/master.crt -ca-file=/opt/nfd/ca.crt
-```
-
-### -verify-node-name
-
-> **NOTE** the gRPC API is deprecated and will be removed in a future release.
-> and this flag will be removed as well.
-
-The `-verify-node-name` flag controls the NodeName based authorization of
-incoming requests and only has effect when mTLS authentication has been enabled
-(with `-ca-file`, `-cert-file` and `-key-file`). If enabled, the worker node
-name of the incoming must match with the CN or a SAN in its TLS certificate. Thus,
-workers are only able to label the node they are running on (or the node whose
-certificate they present).
-
-Node Name based authorization is disabled by default.
-
-Default: *false*
-
-Example:
-
-```bash
-nfd-master -verify-node-name -ca-file=/opt/nfd/ca.crt \
-    -cert-file=/opt/nfd/master.crt -key-file=/opt/nfd/master.key
-```
-
-### -enable-nodefeature-api
-
-> **NOTE** the gRPC API is deprecated and will be removed in a future release.
-> and this flag will be removed as well.
-
-The `-enable-nodefeature-api` flag enables/disables the
-[NodeFeature](../usage/custom-resources.md#nodefeature) CRD API for receiving
-feature requests. This will also automatically disable/enable the gRPC
-interface.
-
-Default: true
-
-Example:
-
-```bash
-nfd-master -enable-nodefeature-api=false
-```
-
 ### -enable-leader-election
 
 The `-enable-leader-election` flag enables leader election for NFD-Master.
 It is advised to turn on this flag when running more than one instance of
 NFD-Master.
 
-This flag takes effect only when combined with `-enable-nodefeature-api` flag.
-
 Default: false
 
 ```bash
-nfd-master -enable-nodefeature-api -enable-leader-election
+nfd-master -enable-leader-election
 ```
 
 ### -enable-taints
@@ -221,30 +126,11 @@ Example:
 nfd-master -no-publish
 ```
 
-### -crd-controller
-
-The `-crd-controller` flag specifies whether the NFD CRD API controller is
-enabled or not. The controller is responsible for processing
-[NodeFeature](../usage/custom-resources.md#nodefeature) and
-[NodeFeatureRule](../usage/custom-resources.md#nodefeaturerule) objects.
-
-Default: *true*
-
-Example:
-
-```bash
-nfd-master -crd-controller=false
-```
-
-### -featurerules-controller
-
-**DEPRECATED**: use [`-crd-controller`](#-crd-controller) instead.
-
 ### -label-whitelist
 
 The `-label-whitelist` specifies a regular expression for filtering feature
-labels based on their name. Each label must match against the given reqular
-expression in order to be published.
+labels based on their name. Each label must match against the given regular
+expression or it will not be published.
 
 > **NOTE:** The regular expression is only matches against the "basename" part
 > of the label, i.e. to the part of the name after '/'. The label namespace is
@@ -266,9 +152,6 @@ other vendor or application specific namespaces for custom labels from the
 local and custom feature sources, even though these labels were denied using
 the `deny-label-ns` flag.
 
-The same namespace control and this flag applies Extended Resources (created
-with `-resource-labels`), too.
-
 Default: *empty*
 
 Example:
@@ -282,14 +165,21 @@ nfd-master -extra-label-ns=vendor-1.com,vendor-2.io
 The `-deny-label-ns` flag specifies a comma-separated list of excluded
 label namespaces. By default, nfd-master allows creating labels in all
 namespaces, excluding `kubernetes.io` namespace and its sub-namespaces
-(i.e. `*.kubernetes.io`). However, you should note that
-`kubernetes.io` and its sub-namespaces are always denied.
+(i.e. `*.kubernetes.io`). `kubernetes.io` and its sub-namespaces (except
+`feature.node.kubernetes.io`, `profile.node.kubernetes.io` and their
+sub-namespaces) stay denied whatever `-deny-label-ns` is set to. A specific
+namespace can only be allowed by listing it in `-extra-label-ns`.
 For example, `nfd-master -deny-label-ns=""` would still disallow
 `kubernetes.io` and `*.kubernetes.io`.
 This option can be used to exclude some vendors or application specific
 namespaces.
-Note that the namespaces `feature.node.kubernetes.io` and `profile.node.kubernetes.io`
-and their sub-namespaces are always allowed and cannot be denied.
+Note that the `feature.node.kubernetes.io` and `profile.node.kubernetes.io`
+namespaces and their sub-namespaces are allowed by default even though they
+are under `kubernetes.io`. They can still be denied explicitly: for example
+`-deny-label-ns=feature.node.kubernetes.io` removes all built-in feature
+labels, and `-deny-label-ns=*.kubernetes.io` removes the labels in all of these
+namespaces. A namespace listed in `-extra-label-ns` is allowed even when
+`-deny-label-ns` denies it.
 
 Default: *empty*
 
@@ -299,21 +189,19 @@ Example:
 nfd-master -deny-label-ns=*.vendor.com,vendor-2.io
 ```
 
-### -resource-labels
+### -informer-page-size
 
-**DEPRECATED**: [NodeFeatureRule](../usage/custom-resources.md#nodefeaturerule)
-should be used for managing extended resources in NFD.
+The `-informer-page-size` flag is used to control pagination
+during informer cache sync on nfd-master startup.
+This is useful to control load on api-server/etcd as listing
+NodeFeature objects can be expensive, especially in large clusters.
 
-The `-resource-labels` flag specifies a comma-separated list of features to be
-advertised as extended resources instead of labels. Features that have integer
-values can be published as Extended Resources by listing them in this flag.
-
-Default: *empty*
+Default: 200
 
 Example:
 
 ```bash
-nfd-master -resource-labels=vendor-1.com/feature-1,vendor-2.io/feature-2
+nfd-master -informer-page-size=20
 ```
 
 ### -config
@@ -327,6 +215,20 @@ Example:
 
 ```bash
 nfd-master -config=/opt/nfd/master.conf
+```
+
+### -kubeconfig
+
+The `-kubeconfig` flag specifies the path to a kubeconfig file to use for
+connecting to the Kubernetes API server. If not specified, the in-cluster
+configuration is used.
+
+Default: *empty*
+
+Example:
+
+```bash
+nfd-master -kubeconfig=${HOME}/.kube/config
 ```
 
 ### -options
@@ -348,8 +250,6 @@ nfd-master -options='{"noPublish": true}'
 
 The `-nfd-api-parallelism` flag can be used to specify the maximum
 number of concurrent node updates.
-
-It takes effect only when `-enable-nodefeature-api` has been set.
 
 Default: 10
 
@@ -375,6 +275,20 @@ Default: false
 Log to standard error as well as files.
 
 Default: false
+
+#### -alsologtostderrthreshold
+
+Logs at or above this threshold go to stderr when -alsologtostderr=true (no
+effect when -logtostderr=true).
+
+Default: 0
+
+#### -legacy_stderr_threshold_behavior
+
+If true, stderrthreshold is ignored when logtostderr=true (legacy behavior). If
+false, stderrthreshold is honored even when logtostderr=true.
+
+Default: true
 
 #### -log_backtrace_at
 
@@ -406,6 +320,13 @@ Default: 1800
 Log to standard error instead of files
 
 Default: true
+
+#### -one_output
+
+If true, only write logs to their native severity level (vs also writing to
+each lower severity level; no effect when -logtostderr=true).
+
+Default: false
 
 #### -skip_headers
 
@@ -443,8 +364,6 @@ The `-resync-period` flag specifies the NFD API controller resync period.
 The resync means nfd-master replaying all NodeFeature and NodeFeatureRule objects,
 thus effectively re-syncing all nodes in the cluster (i.e. ensuring labels, annotations,
 extended resources and taints are in place).
-Only has effect when the [NodeFeature](../usage/custom-resources.md#nodefeature)
-CRD API has been enabled with [`-enable-nodefeature-api`](master-commandline-reference.md#-enable-nodefeature-api).
 
 Default: 1 hour.
 

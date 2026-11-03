@@ -24,7 +24,7 @@ import (
 
 	"k8s.io/klog/v2"
 
-	nfdv1alpha1 "sigs.k8s.io/node-feature-discovery/pkg/apis/nfd/v1alpha1"
+	nfdv1alpha1 "sigs.k8s.io/node-feature-discovery/api/nfd/v1alpha1"
 	"sigs.k8s.io/node-feature-discovery/pkg/utils"
 	"sigs.k8s.io/node-feature-discovery/pkg/utils/hostpath"
 	"sigs.k8s.io/node-feature-discovery/source"
@@ -43,6 +43,7 @@ const Name = "system"
 const (
 	OsReleaseFeature = "osrelease"
 	NameFeature      = "name"
+	DmiIdFeature     = "dmiid"
 )
 
 // systemSource implements the FeatureSource and LabelSource interfaces.
@@ -101,6 +102,40 @@ func (s *systemSource) Discover() error {
 		}
 	}
 
+	// Get DMI ID attributes (publicly readable files under /sys/devices/virtual/dmi/id/).
+	// Serial numbers and product_uuid are excluded as they require root access.
+	dmiIDAttributeNames := []string{
+		"bios_date",
+		"bios_vendor",
+		"bios_version",
+		"board_asset_tag",
+		"board_name",
+		"board_vendor",
+		"board_version",
+		"chassis_asset_tag",
+		"chassis_type",
+		"chassis_vendor",
+		"chassis_version",
+		"product_family",
+		"product_name",
+		"product_sku",
+		"product_version",
+		"sys_vendor",
+	}
+	dmiAttrs := make(map[string]string)
+	for _, name := range dmiIDAttributeNames {
+		val, err := getDmiIDAttribute(name)
+		if err != nil {
+			klog.ErrorS(err, "failed to get DMI entry", "attributeName", name)
+		} else {
+			dmiAttrs[name] = val
+		}
+	}
+
+	if len(dmiAttrs) > 0 {
+		s.features.Attributes[DmiIdFeature] = nfdv1alpha1.NewAttributeFeatures(dmiAttrs)
+	}
+
 	klog.V(3).InfoS("discovered features", "featureSource", s.Name(), "features", utils.DelayedDumper(s.features))
 
 	return nil
@@ -151,6 +186,16 @@ func splitVersion(version string) map[string]string {
 		}
 	}
 	return components
+}
+
+// Read /sys/devices/virtual/dmi/id attribute
+func getDmiIDAttribute(name string) (string, error) {
+	s, err := os.ReadFile(hostpath.SysfsDir.Path("devices/virtual/dmi/id/", name))
+	if err != nil {
+		return "", err
+	}
+
+	return strings.TrimSpace(string(s)), nil
 }
 
 func init() {

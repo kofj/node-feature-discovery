@@ -21,20 +21,18 @@ import (
 	"flag"
 	"sync"
 	"time"
+	"uuid"
 
 	"github.com/onsi/ginkgo/v2"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/apimachinery/pkg/util/wait"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/kubectl/pkg/util/podutils"
-
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
-	"k8s.io/utils/pointer"
 
 	"sigs.k8s.io/node-feature-discovery/test/e2e/utils"
 )
@@ -48,9 +46,7 @@ const (
 // GuaranteedSleeper  makes a Guaranteed QoS class Pod object which long enough forever but requires `cpuLimit` exclusive CPUs.
 func GuaranteedSleeper(opts ...func(pod *corev1.Pod)) *corev1.Pod {
 	p := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "sleeper-gu-pod",
-		},
+		Name: "sleeper-gu-pod",
 		Spec: corev1.PodSpec{
 			RestartPolicy: corev1.RestartPolicyNever,
 			Containers: []corev1.Container{
@@ -60,6 +56,9 @@ func GuaranteedSleeper(opts ...func(pod *corev1.Pod)) *corev1.Pod {
 					Resources: corev1.ResourceRequirements{},
 				},
 			},
+		},
+		Status: corev1.PodStatus{
+			QOSClass: corev1.PodQOSGuaranteed,
 		},
 	}
 	for _, o := range opts {
@@ -77,9 +76,7 @@ func WithLimits(list corev1.ResourceList) func(p *corev1.Pod) {
 // BestEffortSleeper makes a Best Effort QoS class Pod object which sleeps long enough
 func BestEffortSleeper() *corev1.Pod {
 	return &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "sleeper-be-pod",
-		},
+		Name: "sleeper-be-pod",
 		Spec: corev1.PodSpec{
 			RestartPolicy: corev1.RestartPolicyNever,
 			Containers: []corev1.Container{
@@ -120,13 +117,9 @@ type SpecOption func(spec *corev1.PodSpec)
 
 // NFDMaster provide NFD master pod definition
 func NFDMaster(opts ...SpecOption) *corev1.Pod {
-	yes := true
-	no := false
 	p := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			GenerateName: "nfd-master-",
-			Labels:       map[string]string{"name": "nfd-master-e2e"},
-		},
+		GenerateName: "nfd-master-",
+		Labels:       map[string]string{"name": "nfd-master-e2e"},
 		Spec: corev1.PodSpec{
 			Containers: []corev1.Container{
 				{
@@ -147,10 +140,10 @@ func NFDMaster(opts ...SpecOption) *corev1.Pod {
 						Capabilities: &corev1.Capabilities{
 							Drop: []corev1.Capability{"ALL"},
 						},
-						Privileged:               &no,
-						RunAsNonRoot:             &yes,
-						ReadOnlyRootFilesystem:   &yes,
-						AllowPrivilegeEscalation: &no,
+						Privileged:               new(false),
+						RunAsNonRoot:             new(true),
+						ReadOnlyRootFilesystem:   new(true),
+						AllowPrivilegeEscalation: new(false),
 						SeccompProfile: &corev1.SeccompProfile{
 							Type: corev1.SeccompProfileTypeRuntimeDefault,
 						},
@@ -171,9 +164,7 @@ func NFDMaster(opts ...SpecOption) *corev1.Pod {
 // NFDWorker provides NFD worker pod definition
 func NFDWorker(opts ...SpecOption) *corev1.Pod {
 	p := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "nfd-worker-" + string(uuid.NewUUID()),
-		},
+		Name: "nfd-worker-" + uuid.New().String(),
 		Spec: *nfdWorkerSpec(opts...),
 	}
 	return p
@@ -233,12 +224,8 @@ func SpecWithConfigMap(name, mountPath string) SpecOption {
 		spec.Volumes = append(spec.Volumes,
 			corev1.Volume{
 				Name: name,
-				VolumeSource: corev1.VolumeSource{
-					ConfigMap: &corev1.ConfigMapVolumeSource{
-						LocalObjectReference: corev1.LocalObjectReference{
-							Name: name,
-						},
-					},
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					Name: name,
 				},
 			})
 		cnt := &spec.Containers[0]
@@ -252,15 +239,13 @@ func SpecWithConfigMap(name, mountPath string) SpecOption {
 }
 
 func nfdWorkerSpec(opts ...SpecOption) *corev1.PodSpec {
-	yes := true
-	no := false
 	p := &corev1.PodSpec{
 		Containers: []corev1.Container{
 			{
 				Name:            "node-feature-discovery",
 				ImagePullPolicy: pullPolicy(),
 				Command:         []string{"nfd-worker"},
-				Args:            []string{"-server=nfd-master-e2e:8080"},
+				Args:            []string{},
 				Env: []corev1.EnvVar{
 					{
 						Name: "NODE_NAME",
@@ -270,15 +255,31 @@ func nfdWorkerSpec(opts ...SpecOption) *corev1.PodSpec {
 							},
 						},
 					},
+					{
+						Name: "POD_NAME",
+						ValueFrom: &corev1.EnvVarSource{
+							FieldRef: &corev1.ObjectFieldSelector{
+								FieldPath: "metadata.name",
+							},
+						},
+					},
+					{
+						Name: "POD_UID",
+						ValueFrom: &corev1.EnvVarSource{
+							FieldRef: &corev1.ObjectFieldSelector{
+								FieldPath: "metadata.uid",
+							},
+						},
+					},
 				},
 				SecurityContext: &corev1.SecurityContext{
 					Capabilities: &corev1.Capabilities{
 						Drop: []corev1.Capability{"ALL"},
 					},
-					Privileged:               &no,
-					RunAsNonRoot:             &yes,
-					ReadOnlyRootFilesystem:   &yes,
-					AllowPrivilegeEscalation: &no,
+					Privileged:               new(false),
+					RunAsNonRoot:             new(true),
+					ReadOnlyRootFilesystem:   new(true),
+					AllowPrivilegeEscalation: new(false),
 					SeccompProfile: &corev1.SeccompProfile{
 						Type: corev1.SeccompProfileTypeRuntimeDefault,
 					},
@@ -312,38 +313,30 @@ func nfdWorkerSpec(opts ...SpecOption) *corev1.PodSpec {
 		Volumes: []corev1.Volume{
 			{
 				Name: "host-boot",
-				VolumeSource: corev1.VolumeSource{
-					HostPath: &corev1.HostPathVolumeSource{
-						Path: "/boot",
-						Type: newHostPathType(corev1.HostPathDirectory),
-					},
+				HostPath: &corev1.HostPathVolumeSource{
+					Path: "/boot",
+					Type: newHostPathType(corev1.HostPathDirectory),
 				},
 			},
 			{
 				Name: "host-os-release",
-				VolumeSource: corev1.VolumeSource{
-					HostPath: &corev1.HostPathVolumeSource{
-						Path: "/etc/os-release",
-						Type: newHostPathType(corev1.HostPathFile),
-					},
+				HostPath: &corev1.HostPathVolumeSource{
+					Path: "/etc/os-release",
+					Type: newHostPathType(corev1.HostPathFile),
 				},
 			},
 			{
 				Name: "host-sys",
-				VolumeSource: corev1.VolumeSource{
-					HostPath: &corev1.HostPathVolumeSource{
-						Path: "/sys",
-						Type: newHostPathType(corev1.HostPathDirectory),
-					},
+				HostPath: &corev1.HostPathVolumeSource{
+					Path: "/sys",
+					Type: newHostPathType(corev1.HostPathDirectory),
 				},
 			},
 			{
 				Name: "host-usr-lib",
-				VolumeSource: corev1.VolumeSource{
-					HostPath: &corev1.HostPathVolumeSource{
-						Path: "/usr/lib",
-						Type: newHostPathType(corev1.HostPathDirectory),
-					},
+				HostPath: &corev1.HostPathVolumeSource{
+					Path: "/usr/lib",
+					Type: newHostPathType(corev1.HostPathDirectory),
 				},
 			},
 		},
@@ -356,8 +349,6 @@ func nfdWorkerSpec(opts ...SpecOption) *corev1.PodSpec {
 }
 
 func NFDGCSpec(opts ...SpecOption) *corev1.PodSpec {
-	yes := true
-	no := false
 	p := &corev1.PodSpec{
 		Containers: []corev1.Container{
 			{
@@ -368,10 +359,10 @@ func NFDGCSpec(opts ...SpecOption) *corev1.PodSpec {
 					Capabilities: &corev1.Capabilities{
 						Drop: []corev1.Capability{"ALL"},
 					},
-					Privileged:               &no,
-					RunAsNonRoot:             &yes,
-					ReadOnlyRootFilesystem:   &yes,
-					AllowPrivilegeEscalation: &no,
+					Privileged:               new(false),
+					RunAsNonRoot:             new(true),
+					ReadOnlyRootFilesystem:   new(true),
+					AllowPrivilegeEscalation: new(false),
 					SeccompProfile: &corev1.SeccompProfile{
 						Type: corev1.SeccompProfileTypeRuntimeDefault,
 					},
@@ -412,9 +403,9 @@ func NFDTopologyUpdaterSpec(kc utils.KubeletConfig, opts ...SpecOption) *corev1.
 					Capabilities: &corev1.Capabilities{
 						Drop: []corev1.Capability{"ALL"},
 					},
-					RunAsUser:                pointer.Int64(0),
-					ReadOnlyRootFilesystem:   pointer.Bool(true),
-					AllowPrivilegeEscalation: pointer.Bool(false),
+					RunAsUser:                new(int64(0)),
+					ReadOnlyRootFilesystem:   new(true),
+					AllowPrivilegeEscalation: new(false),
 					SeccompProfile: &corev1.SeccompProfile{
 						Type: corev1.SeccompProfileTypeRuntimeDefault,
 					},
@@ -444,38 +435,30 @@ func NFDTopologyUpdaterSpec(kc utils.KubeletConfig, opts ...SpecOption) *corev1.
 		Volumes: []corev1.Volume{
 			{
 				Name: "kubelet-state-files",
-				VolumeSource: corev1.VolumeSource{
-					HostPath: &corev1.HostPathVolumeSource{
-						Path: "/var/lib/kubelet",
-						Type: newHostPathType(corev1.HostPathDirectory),
-					},
+				HostPath: &corev1.HostPathVolumeSource{
+					Path: "/var/lib/kubelet",
+					Type: newHostPathType(corev1.HostPathDirectory),
 				},
 			},
 			{
 				Name: "kubelet-podresources-conf",
-				VolumeSource: corev1.VolumeSource{
-					HostPath: &corev1.HostPathVolumeSource{
-						Path: kc.ConfigPath,
-						Type: newHostPathType(corev1.HostPathFile),
-					},
+				HostPath: &corev1.HostPathVolumeSource{
+					Path: kc.ConfigPath,
+					Type: newHostPathType(corev1.HostPathFile),
 				},
 			},
 			{
 				Name: "kubelet-podresources-sock",
-				VolumeSource: corev1.VolumeSource{
-					HostPath: &corev1.HostPathVolumeSource{
-						Path: kc.PodResourcesSocketPath,
-						Type: newHostPathType(corev1.HostPathSocket),
-					},
+				HostPath: &corev1.HostPathVolumeSource{
+					Path: kc.PodResourcesSocketPath,
+					Type: newHostPathType(corev1.HostPathSocket),
 				},
 			},
 			{
 				Name: "host-sys",
-				VolumeSource: corev1.VolumeSource{
-					HostPath: &corev1.HostPathVolumeSource{
-						Path: "/sys",
-						Type: newHostPathType(corev1.HostPathDirectory),
-					},
+				HostPath: &corev1.HostPathVolumeSource{
+					Path: "/sys",
+					Type: newHostPathType(corev1.HostPathDirectory),
 				},
 			},
 		},
@@ -519,4 +502,11 @@ func pullPolicy() corev1.PullPolicy {
 		return corev1.PullIfNotPresent
 	}
 	return corev1.PullAlways
+}
+
+// PullPolicy returns the image pull policy selected via the
+// -nfd.pull-if-not-present flag, so other e2e helpers (e.g. Helm-based
+// deployments) can honor the same setting.
+func PullPolicy() corev1.PullPolicy {
+	return pullPolicy()
 }

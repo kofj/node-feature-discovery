@@ -19,14 +19,17 @@ package cpu
 import (
 	"fmt"
 	"os"
+	"regexp"
+	"runtime"
 	"strconv"
+	"strings"
 
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
 
 	"github.com/klauspost/cpuid/v2"
 
-	nfdv1alpha1 "sigs.k8s.io/node-feature-discovery/pkg/apis/nfd/v1alpha1"
+	nfdv1alpha1 "sigs.k8s.io/node-feature-discovery/api/nfd/v1alpha1"
 	"sigs.k8s.io/node-feature-discovery/pkg/utils"
 	"sigs.k8s.io/node-feature-discovery/pkg/utils/hostpath"
 	"sigs.k8s.io/node-feature-discovery/source"
@@ -63,6 +66,7 @@ func newDefaultConfig() *Config {
 	return &Config{
 		cpuidConfig{
 			AttributeBlacklist: []string{
+				"AVX10",
 				"BMI1",
 				"BMI2",
 				"CLMUL",
@@ -148,6 +152,9 @@ func (s *cpuSource) GetLabels() (source.FeatureLabels, error) {
 			labels["cpuid."+f] = true
 		}
 	}
+	for f, v := range features.Attributes[CpuidFeature].Elements {
+		labels["cpuid."+f] = v
+	}
 
 	// CPU model
 	for k, v := range features.Attributes[Cpumodel].Elements {
@@ -162,15 +169,6 @@ func (s *cpuSource) GetLabels() (source.FeatureLabels, error) {
 	// Pstate
 	for k, v := range features.Attributes[PstateFeature].Elements {
 		labels["pstate."+k] = v
-	}
-
-	// RDT
-	for k, v := range features.Attributes[RdtFeature].Elements {
-		if k == "RDTL3CA_NUM_CLOSID" {
-			continue
-		}
-
-		labels["rdt."+k] = v
 	}
 
 	// Security
@@ -202,6 +200,16 @@ func (s *cpuSource) GetLabels() (source.FeatureLabels, error) {
 		labels["coprocessor.nx_gzip"] = v
 	}
 
+	_, err := os.ReadFile(hostpath.SysfsDir.Path("sys/devices/cpu_atom/cpus"))
+	if err == nil {
+		labels["cpu_atom"] = true
+	}
+
+	_, err = os.ReadFile(hostpath.SysfsDir.Path("sys/devices/cpu_core/cpus"))
+	if err == nil {
+		labels["cpu_core"] = true
+	}
+
 	return labels, nil
 }
 
@@ -211,6 +219,9 @@ func (s *cpuSource) Discover() error {
 
 	// Detect CPUID
 	s.features.Flags[CpuidFeature] = nfdv1alpha1.NewFlagFeatures(getCpuidFlags()...)
+	if cpuidAttrs := getCpuidAttributes(); cpuidAttrs != nil {
+		s.features.Attributes[CpuidFeature] = nfdv1alpha1.NewAttributeFeatures(cpuidAttrs)
+	}
 
 	// Detect CPU model
 	s.features.Attributes[Cpumodel] = nfdv1alpha1.NewAttributeFeatures(getCPUModel())
@@ -264,44 +275,161 @@ func getCPUModel() map[string]string {
 	cpuModelInfo["family"] = strconv.Itoa(cpuid.CPU.Family)
 	cpuModelInfo["id"] = strconv.Itoa(cpuid.CPU.Model)
 
+	hypervisor, err := getHypervisor()
+	if err != nil {
+		klog.ErrorS(err, "failed to detect hypervisor")
+	} else if hypervisor != "" {
+		cpuModelInfo["hypervisor"] = hypervisor
+	}
+
+	if runtime.GOARCH == "s390x" {
+		s390xAttrs := getS390xAttributes()
+		if v := s390xAttrs["vendor_id"]; v != "" {
+			cpuModelInfo["vendor_id"] = v
+		}
+		if f := s390xAttrs["family"]; f != "" && f != "0" {
+			cpuModelInfo["family"] = f
+		}
+		if id := s390xAttrs["id"]; id != "" && id != "0" {
+			cpuModelInfo["id"] = id
+		}
+
+	}
+
 	return cpuModelInfo
+}
+
+// getHypervisor detects the hypervisor on s390x by reading /proc/sysinfo
+// and on x86_64/arm64 using the cpuid library.
+// Returns normalized hypervisor string, "unknown" for unknown vendor, or "none" for bare metal.
+func getHypervisor() (string, error) {
+	// use /proc/sysinfo for s390x
+	if runtime.GOARCH == "s390x" {
+		return getHypervisorFromProcSysinfo()
+	}
+
+	// use cpuid lib for x86/arm
+	if cpuid.CPU.VM() {
+		return getHypervisorFromCPUID()
+	}
+
+	// no hv discovered
+	return "none", nil
+}
+
+func getHypervisorFromProcSysinfo() (string, error) {
+	data, err := os.ReadFile("/proc/sysinfo")
+	if err != nil {
+		klog.ErrorS(err, "failed to read /proc/sysinfo")
+		return "", err
+	}
+
+	hypervisor := ""
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.Contains(line, "Control Program:") {
+			parts := strings.SplitN(line, ":", 2)
+			if len(parts) == 2 {
+				hypervisor = strings.TrimSpace(parts[1])
+			}
+			break
+		}
+	}
+	if hypervisor == "" {
+		return "none", nil
+	}
+	// Replace forbidden symbols
+	fullRegex := regexp.MustCompile("[^-A-Za-z0-9_.]+")
+	hypervisor = fullRegex.ReplaceAllString(hypervisor, "_")
+
+	return hypervisor, nil
+}
+
+func getS390xAttributes() map[string]string {
+	attrs := make(map[string]string)
+	attrs["vendor_id"] = ""
+	attrs["family"] = "0"
+	attrs["id"] = "0"
+
+	if data, err := os.ReadFile("/proc/cpuinfo"); err == nil {
+		lines := strings.Split(string(data), "\n")
+		for _, line := range lines {
+			parts := strings.SplitN(line, ":", 2)
+			if len(parts) < 2 {
+				continue
+			}
+			key := strings.TrimSpace(parts[0])
+			val := strings.TrimSpace(parts[1])
+
+			switch key {
+			case "vendor_id":
+				// Sanitize IBM/S390 -> IBM_S390
+				attrs["vendor_id"] = regexp.MustCompile("[^-A-Za-z0-9_.]+").ReplaceAllString(val, "_")
+			case "machine":
+				attrs["id"] = val
+			case "identification":
+				if attrs["family"] == "0" { // Only set once for the first processor found
+					attrs["family"] = val
+				}
+			}
+		}
+	}
+	return attrs
+}
+
+func getHypervisorFromCPUID() (string, error) {
+	hv := cpuid.CPU.HypervisorVendorID
+	if hv == cpuid.VendorUnknown {
+		raw := cpuid.CPU.HypervisorVendorString
+		clean := regexp.MustCompile("[^-A-Za-z0-9_.]+").ReplaceAllString(raw, "_")
+		if clean == "" {
+			return "unknown", nil
+		}
+		return clean, nil
+	}
+	return strings.ToLower(hv.String()), nil
 }
 
 func discoverTopology() map[string]string {
 	features := make(map[string]string)
 
-	if ht, err := haveThreadSiblings(); err != nil {
-		klog.ErrorS(err, "failed to detect hyper-threading")
-	} else {
-		features["hardware_multithreading"] = strconv.FormatBool(ht)
-	}
-
-	return features
-}
-
-// Check if any (online) CPUs have thread siblings
-func haveThreadSiblings() (bool, error) {
-
 	files, err := os.ReadDir(hostpath.SysfsDir.Path("bus/cpu/devices"))
 	if err != nil {
-		return false, err
+		klog.ErrorS(err, "failed to read devices folder")
+		return features
 	}
+
+	ht := false
+	uniquePhysicalIDs := sets.NewString()
 
 	for _, file := range files {
 		// Try to read siblings from topology
 		siblings, err := os.ReadFile(hostpath.SysfsDir.Path("bus/cpu/devices", file.Name(), "topology/thread_siblings_list"))
 		if err != nil {
-			return false, err
+			klog.ErrorS(err, "error while reading thread_sigblings_list file")
+			return map[string]string{}
 		}
 		for _, char := range siblings {
 			// If list separator found, we determine that there are multiple siblings
 			if char == ',' || char == '-' {
-				return true, nil
+				ht = true
+				break
 			}
 		}
+
+		// Try to read physical_package_id from topology
+		physicalID, err := os.ReadFile(hostpath.SysfsDir.Path("bus/cpu/devices", file.Name(), "topology/physical_package_id"))
+		if err != nil {
+			klog.ErrorS(err, "error while reading physical_package_id file")
+			return map[string]string{}
+		}
+		id := strings.TrimSpace(string(physicalID))
+		uniquePhysicalIDs.Insert(id)
 	}
-	// No siblings were found
-	return false, nil
+
+	features["hardware_multithreading"] = strconv.FormatBool(ht)
+	features["socket_count"] = strconv.FormatInt(int64(uniquePhysicalIDs.Len()), 10)
+
+	return features
 }
 
 func (s *cpuSource) initCpuidFilter() {
@@ -331,6 +459,18 @@ func (f keyFilter) unmask(k string) bool {
 		}
 	}
 	return false
+}
+
+// microarchLevelFlags maps an x86-64 psABI microarchitecture level to its
+// cumulative feature names (X86_64_V1..X86_64_V<level>); a level <= 0 yields
+// none. It is kept in this arch-neutral file, rather than cpuid_amd64.go, so
+// the mapping can be unit tested on any GOARCH.
+func microarchLevelFlags(level int) []string {
+	var flags []string
+	for i := 1; i <= level; i++ {
+		flags = append(flags, fmt.Sprintf("X86_64_V%d", i))
+	}
+	return flags
 }
 
 func init() {

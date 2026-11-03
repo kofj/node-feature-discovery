@@ -17,36 +17,35 @@ limitations under the License.
 package nfdworker
 
 import (
-	"fmt"
-	"net/http"
-
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"k8s.io/klog/v2"
 	"sigs.k8s.io/node-feature-discovery/pkg/version"
 )
 
 // When adding metric names, see https://prometheus.io/docs/practices/naming/#metric-names
-// When adding metric names, see https://prometheus.io/docs/practices/naming/#metric-names
 const (
-	buildInfoQuery                = "nfd_worker_build_info"
-	featureDiscoveryDurationQuery = "nfd_feature_discovery_duration_seconds"
+	buildInfoQuery                = "build_info"
+	featureDiscoveryDurationQuery = "feature_discovery_duration_seconds"
+)
+
+const (
+	// nfdWorkerPrefix - subsystem name used by nfd worker.
+	nfdWorkerPrefix = "nfd_worker"
 )
 
 var (
-	srv *http.Server
-
 	featureDiscoveryDuration = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
-			Name:    featureDiscoveryDurationQuery,
-			Help:    "Time taken to discover features",
-			Buckets: []float64{0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1},
+			Subsystem: nfdWorkerPrefix,
+			Name:      featureDiscoveryDurationQuery,
+			Help:      "Time taken to discover features",
+			Buckets:   []float64{0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1},
 		},
 		[]string{"node"},
 	)
 	buildInfo = prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: buildInfoQuery,
-		Help: "Version from which Node Feature Discovery was built.",
+		Subsystem: nfdWorkerPrefix,
+		Name:      buildInfoQuery,
+		Help:      "Version from which Node Feature Discovery was built.",
 		ConstLabels: map[string]string{
 			"version": version.Get(),
 		},
@@ -56,26 +55,4 @@ var (
 // registerVersion exposes the Operator build version.
 func registerVersion(version string) {
 	buildInfo.SetToCurrentTime()
-}
-
-// runMetricsServer starts a http server to expose metrics
-func runMetricsServer(port int) {
-	r := prometheus.NewRegistry()
-	r.MustRegister(featureDiscoveryDuration)
-	r.MustRegister(buildInfo)
-
-	mux := http.NewServeMux()
-	mux.Handle("/metrics", promhttp.HandlerFor(r, promhttp.HandlerOpts{}))
-
-	klog.InfoS("metrics server starting", "port", port)
-	srv = &http.Server{Addr: fmt.Sprintf(":%d", port), Handler: mux}
-	klog.InfoS("metrics server stopped", "exit code", srv.ListenAndServe())
-}
-
-// stopMetricsServer stops the metrics server
-func stopMetricsServer() {
-	if srv != nil {
-		klog.InfoS("stopping metrics server", "port", srv.Addr)
-		srv.Close()
-	}
 }

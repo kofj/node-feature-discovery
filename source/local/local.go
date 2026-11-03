@@ -18,16 +18,18 @@ package local
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"k8s.io/klog/v2"
 
-	nfdv1alpha1 "sigs.k8s.io/node-feature-discovery/pkg/apis/nfd/v1alpha1"
+	"github.com/fsnotify/fsnotify"
+	nfdv1alpha1 "sigs.k8s.io/node-feature-discovery/api/nfd/v1alpha1"
 	"sigs.k8s.io/node-feature-discovery/pkg/utils"
 	"sigs.k8s.io/node-feature-discovery/source"
 )
@@ -38,9 +40,22 @@ const Name = "local"
 // LabelFeature of this feature source
 const LabelFeature = "label"
 
-// ExpiryTimeKey is the key of this feature source indicating
-// when features should be removed.
-const ExpiryTimeKey = "expiry-time"
+// RawFeature of this feature source
+const RawFeature = "feature"
+
+const (
+	// ExpiryTimeKey is the key of this feature source indicating
+	// when features should be removed.
+	DirectiveExpiryTime = "expiry-time"
+
+	// NoLabel indicates whether the feature should be included
+	// in exposed labels or not.
+	DirectiveNoLabel = "no-label"
+
+	// NoFeature indicates whether the feature should be included
+	// in exposed raw features or not.
+	DirectiveNoFeature = "no-feature"
+)
 
 // DirectivePrefix defines the prefix of directives that should be parsed
 const DirectivePrefix = "# +"
@@ -51,37 +66,41 @@ const MaxFeatureFileSize = 65536
 // Config
 var (
 	featureFilesDir = "/etc/kubernetes/node-feature-discovery/features.d/"
-	hookDir         = "/etc/kubernetes/node-feature-discovery/source.d/"
 )
 
-// localSource implements the FeatureSource and LabelSource interfaces.
+// localSource implements the FeatureSource, LabelSource, EventSource interfaces.
 type localSource struct {
-	features *nfdv1alpha1.Features
-	config   *Config
+	features   *nfdv1alpha1.Features
+	config     *Config
+	cancelFunc context.CancelFunc // cancels the active notifier goroutine
+	wg         sync.WaitGroup     // tracks the active notifier goroutine
+	mu         sync.Mutex         // serializes SetNotifyChannel and protects fields
 }
 
 type Config struct {
-	HooksEnabled bool `json:"hooksEnabled,omitempty"`
 }
 
 // parsingOpts contains options used for directives parsing
 type parsingOpts struct {
-	ExpiryTime time.Time
+	ExpiryTime  time.Time
+	SkipLabel   bool
+	SkipFeature bool
 }
 
 // Singleton source instance
 var (
-	src                           = localSource{config: newDefaultConfig()}
+	src                           = localSource{}
 	_   source.FeatureSource      = &src
 	_   source.LabelSource        = &src
 	_   source.ConfigurableSource = &src
+	_   source.EventSource        = &src
 )
 
 // Name method of the LabelSource interface
 func (s *localSource) Name() string { return Name }
 
 // NewConfig method of the LabelSource interface
-func (s *localSource) NewConfig() source.Config { return newDefaultConfig() }
+func (s *localSource) NewConfig() source.Config { return &Config{} }
 
 // GetConfig method of the LabelSource interface
 func (s *localSource) GetConfig() source.Config { return s.config }
@@ -110,42 +129,17 @@ func (s *localSource) GetLabels() (source.FeatureLabels, error) {
 	return labels, nil
 }
 
-// newDefaultConfig returns a new config with pre-populated defaults
-func newDefaultConfig() *Config {
-	return &Config{
-		HooksEnabled: false,
-	}
-}
-
 // Discover method of the FeatureSource interface
 func (s *localSource) Discover() error {
 	s.features = nfdv1alpha1.NewFeatures()
 
-	featuresFromFiles, err := getFeaturesFromFiles()
+	featuresFromFiles, labelsFromFiles, err := getFeaturesFromFiles()
 	if err != nil {
 		klog.ErrorS(err, "failed to read feature files")
 	}
 
-	if s.config.HooksEnabled {
-
-		klog.InfoS("starting hooks...")
-		klog.InfoS("NOTE: hooks are deprecated and will be completely removed in a future release.")
-
-		featuresFromHooks, err := getFeaturesFromHooks()
-		if err != nil {
-			klog.ErrorS(err, "failed to run hooks")
-		}
-
-		// Merge features from hooks and files
-		for k, v := range featuresFromHooks {
-			if old, ok := featuresFromFiles[k]; ok {
-				klog.InfoS("overriding label value", "labelKey", k, "oldValue", old, "newValue", v)
-			}
-			featuresFromFiles[k] = v
-		}
-	}
-
-	s.features.Attributes[LabelFeature] = nfdv1alpha1.NewAttributeFeatures(featuresFromFiles)
+	s.features.Attributes[LabelFeature] = nfdv1alpha1.NewAttributeFeatures(labelsFromFiles)
+	s.features.Attributes[RawFeature] = nfdv1alpha1.NewAttributeFeatures(featuresFromFiles)
 
 	klog.V(3).InfoS("discovered features", "featureSource", s.Name(), "features", utils.DelayedDumper(s.features))
 
@@ -169,18 +163,21 @@ func parseDirectives(line string, opts *parsingOpts) error {
 	split := strings.SplitN(directive, "=", 2)
 	key := split[0]
 
-	if len(split) == 1 {
-		return fmt.Errorf("invalid directive format in %q, should be '# +key=value'", line)
-	}
-	value := split[1]
-
 	switch key {
-	case ExpiryTimeKey:
+	case DirectiveExpiryTime:
+		if len(split) == 1 {
+			return fmt.Errorf("invalid directive format in %q, should be '# +expiry-time=value'", line)
+		}
+		value := split[1]
 		expiryDate, err := time.Parse(time.RFC3339, strings.TrimSpace(value))
 		if err != nil {
 			return fmt.Errorf("failed to parse expiry-date directive: %w", err)
 		}
 		opts.ExpiryTime = expiryDate
+	case DirectiveNoFeature:
+		opts.SkipFeature = true
+	case DirectiveNoLabel:
+		opts.SkipLabel = true
 	default:
 		return fmt.Errorf("unknown feature file directive %q", key)
 	}
@@ -188,11 +185,15 @@ func parseDirectives(line string, opts *parsingOpts) error {
 	return nil
 }
 
-func parseFeatures(lines [][]byte, fileName string) map[string]string {
+func parseFeatureFile(lines [][]byte, fileName string) (map[string]string, map[string]string) {
 	features := make(map[string]string)
+	labels := make(map[string]string)
+
 	now := time.Now()
 	parsingOpts := &parsingOpts{
-		ExpiryTime: now,
+		ExpiryTime:  now,
+		SkipLabel:   false,
+		SkipFeature: false,
 	}
 
 	for _, l := range lines {
@@ -217,113 +218,57 @@ func parseFeatures(lines [][]byte, fileName string) map[string]string {
 
 			key := lineSplit[0]
 
-			// Check if it's a boolean value
-			if len(lineSplit) == 1 {
-				features[key] = "true"
+			if !parsingOpts.SkipFeature {
+				updateFeatures(features, lineSplit)
 			} else {
-				features[key] = lineSplit[1]
+				delete(features, key)
 			}
+
+			if !parsingOpts.SkipLabel {
+				updateFeatures(labels, lineSplit)
+			} else {
+				delete(labels, key)
+			}
+			// SkipFeature and SkipLabel only take effect for one feature
+			parsingOpts.SkipFeature = false
+			parsingOpts.SkipLabel = false
 		}
 	}
 
-	return features
+	return features, labels
 }
 
-// Run all hooks and get features
-func getFeaturesFromHooks() (map[string]string, error) {
+func updateFeatures(m map[string]string, lineSplit []string) {
+	key := lineSplit[0]
+	// Check if it's a boolean value
+	if len(lineSplit) == 1 {
+		m[key] = "true"
 
-	features := make(map[string]string)
-
-	files, err := os.ReadDir(hookDir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			klog.InfoS("hook directory does not exist", "path", hookDir)
-			return features, nil
-		}
-		return features, fmt.Errorf("unable to access %v: %v", hookDir, err)
+	} else {
+		m[key] = lineSplit[1]
 	}
-	if len(files) > 0 {
-		klog.InfoS("hooks are DEPRECATED since v0.12.0 and support will be removed in a future release; use feature files instead")
-	}
-
-	for _, file := range files {
-		fileName := file.Name()
-		lines, err := runHook(fileName)
-		if err != nil {
-			klog.ErrorS(err, "failed to run hook", "fileName", fileName)
-			continue
-		}
-
-		// Append features
-		fileFeatures := parseFeatures(lines, fileName)
-		klog.V(4).InfoS("hook executed", "fileName", fileName, "features", utils.DelayedDumper(fileFeatures))
-		for k, v := range fileFeatures {
-			if old, ok := features[k]; ok {
-				klog.InfoS("overriding label value from another hook", "labelKey", k, "oldValue", old, "newValue", v, "fileName", fileName)
-			}
-			features[k] = v
-		}
-	}
-
-	return features, nil
-}
-
-// Run one hook
-func runHook(file string) ([][]byte, error) {
-	var lines [][]byte
-
-	path := filepath.Join(hookDir, file)
-	filestat, err := os.Stat(path)
-	if err != nil {
-		klog.ErrorS(err, "failed to get filestat, skipping hook", "path", path)
-		return lines, err
-	}
-
-	if filestat.Mode().IsRegular() {
-		cmd := exec.Command(path)
-		var stdout bytes.Buffer
-		var stderr bytes.Buffer
-		cmd.Stdout = &stdout
-		cmd.Stderr = &stderr
-
-		// Run hook
-		err = cmd.Run()
-
-		// Forward stderr to our logger
-		errLines := bytes.Split(stderr.Bytes(), []byte("\n"))
-		for i, line := range errLines {
-			if i == len(errLines)-1 && len(line) == 0 {
-				// Don't print the last empty string
-				break
-			}
-			klog.InfoS(fmt.Sprintf("%s: %s", file, line))
-		}
-
-		// Do not return any lines if an error occurred
-		if err != nil {
-			return lines, err
-		}
-		lines = bytes.Split(stdout.Bytes(), []byte("\n"))
-	}
-
-	return lines, nil
 }
 
 // Read all files to get features
-func getFeaturesFromFiles() (map[string]string, error) {
+func getFeaturesFromFiles() (map[string]string, map[string]string, error) {
 	features := make(map[string]string)
+	labels := make(map[string]string)
 
 	files, err := os.ReadDir(featureFilesDir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			klog.InfoS("features directory does not exist", "path", featureFilesDir)
-			return features, nil
+			return features, labels, nil
 		}
-		return features, fmt.Errorf("unable to access %v: %v", featureFilesDir, err)
+		return features, labels, fmt.Errorf("unable to access %v: %w", featureFilesDir, err)
 	}
 
 	for _, file := range files {
 		fileName := file.Name()
+		// ignore hidden feature file
+		if strings.HasPrefix(fileName, ".") {
+			continue
+		}
 		lines, err := getFileContent(fileName)
 		if err != nil {
 			klog.ErrorS(err, "failed to read file", "fileName", fileName)
@@ -331,18 +276,25 @@ func getFeaturesFromFiles() (map[string]string, error) {
 		}
 
 		// Append features
-		fileFeatures := parseFeatures(lines, fileName)
+		fileFeatures, fileLabels := parseFeatureFile(lines, fileName)
 
 		klog.V(4).InfoS("feature file read", "fileName", fileName, "features", utils.DelayedDumper(fileFeatures))
 		for k, v := range fileFeatures {
 			if old, ok := features[k]; ok {
-				klog.InfoS("overriding label value from another feature file", "labelKey", k, "oldValue", old, "newValue", v, "fileName", fileName)
+				klog.InfoS("overriding label value from another feature file", "featureKey", k, "oldValue", old, "newValue", v, "fileName", fileName)
 			}
 			features[k] = v
 		}
+
+		for k, v := range fileLabels {
+			if old, ok := labels[k]; ok {
+				klog.InfoS("overriding label value from another feature file", "labelKey", k, "oldValue", old, "newValue", v, "fileName", fileName)
+			}
+			labels[k] = v
+		}
 	}
 
-	return features, nil
+	return features, labels, nil
 }
 
 // Read one file
@@ -371,6 +323,102 @@ func getFileContent(fileName string) ([][]byte, error) {
 	}
 
 	return lines, nil
+}
+
+// runNotifier returns a function that watches for fsnotify events and sends
+// notifications on ch. The returned function closes the watcher when done.
+func (s *localSource) runNotifier(ctx context.Context, ch chan *source.FeatureSource, watcher *fsnotify.Watcher) func() {
+	return func() {
+		rateLimit := time.NewTicker(time.Second)
+		defer rateLimit.Stop()
+		defer func() {
+			// Each goroutine is responsible for closing its own watcher
+			if err := watcher.Close(); err != nil {
+				klog.ErrorS(err, "failed to close fsnotify watcher")
+			}
+		}()
+		limit := false
+		for {
+			select {
+			case event := <-watcher.Events:
+				opAny := fsnotify.Create | fsnotify.Write | fsnotify.Remove | fsnotify.Rename | fsnotify.Chmod
+				if event.Op&opAny != 0 {
+					klog.V(2).InfoS("fsnotify event", "eventName", event.Name, "eventOp", event.Op)
+					if !limit {
+						fs := source.FeatureSource(s)
+						ch <- &fs
+						limit = true
+					}
+				}
+			case err := <-watcher.Errors:
+				klog.ErrorS(err, "failed to watch features.d changes")
+			case <-rateLimit.C:
+				limit = false
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
+}
+
+// stopNotifier cancels the active notifier goroutine.
+// The goroutine is responsible for closing its own watcher.
+// Must be called with s.mu held.
+func (s *localSource) stopNotifier() {
+	if s.cancelFunc != nil {
+		s.cancelFunc()
+		s.cancelFunc = nil
+	}
+}
+
+// createWatcher creates a new fsnotify watcher for the feature files directory.
+func createWatcher() (*fsnotify.Watcher, error) {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		return nil, err
+	}
+
+	if err := watcher.Add(featureFilesDir); err != nil {
+		if errClose := watcher.Close(); errClose != nil {
+			klog.ErrorS(errClose, "failed to close fsnotify watcher")
+		}
+		return nil, fmt.Errorf("unable to access %v: %w", featureFilesDir, err)
+	}
+
+	return watcher, nil
+}
+
+// SetNotifyChannel method of the EventSource Interface
+func (s *localSource) SetNotifyChannel(ctx context.Context, ch chan *source.FeatureSource) error {
+	info, err := os.Stat(featureFilesDir)
+	if err != nil {
+		return err
+	}
+
+	if info.IsDir() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+
+		// Create watcher under lock to prevent concurrent calls from
+		// creating multiple watchers where some leak due to race conditions.
+		watcher, err := createWatcher()
+		if err != nil {
+			return err
+		}
+
+		// Stop any existing notifier and wait for it to fully exit.
+		// Safe to wait under lock since runNotifier doesn't acquire mu.
+		s.stopNotifier()
+		s.wg.Wait()
+
+		// Create a cancellable context for the notifier goroutine
+		notifyCtx, cancel := context.WithCancel(ctx)
+		s.cancelFunc = cancel
+
+		s.wg.Go(s.runNotifier(notifyCtx, ch, watcher))
+	}
+
+	return nil
 }
 
 func init() {

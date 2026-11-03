@@ -70,7 +70,11 @@ func TestGetMemoryResourceCounters(t *testing.T) {
 	if err != nil {
 		t.Errorf("failed to create temporary directory: %v", err)
 	}
-	defer os.RemoveAll(rootDir) // clean up
+	defer func() {
+		if err := os.RemoveAll(rootDir); err != nil {
+			t.Logf("failed to remove temporary directory %q: %v", rootDir, err)
+		}
+	}()
 
 	sysBusNodeBasepath = rootDir
 
@@ -118,7 +122,7 @@ func TestGetMemoryResourceCounters(t *testing.T) {
 }
 
 func makeMemoryTree(root string, numNodes int) error {
-	for idx := 0; idx < numNodes; idx++ {
+	for idx := range numNodes {
 		path := filepath.Join(
 			root,
 			fmt.Sprintf("node%d", idx),
@@ -136,7 +140,7 @@ func makeMemoryTree(root string, numNodes int) error {
 }
 
 func makeHugepagesTree(root string, numNodes int) error {
-	for idx := 0; idx < numNodes; idx++ {
+	for idx := range numNodes {
 		for _, size := range []int{HugepageSize2Mi, HugepageSize1Gi} {
 			path := filepath.Join(
 				root,
@@ -163,5 +167,5 @@ func setHPCount(root string, nodeID, pageSize, numPages int) error {
 		fmt.Sprintf("hugepages-%dkB", pageSize),
 		"nr_hugepages",
 	)
-	return os.WriteFile(path, []byte(fmt.Sprintf("%d", numPages)), 0644)
+	return os.WriteFile(path, fmt.Appendf(nil, "%d", numPages), 0644)
 }

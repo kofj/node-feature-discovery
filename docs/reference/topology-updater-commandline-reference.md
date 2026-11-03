@@ -46,10 +46,10 @@ nfd-topology-updater -config=/opt/nfd/nfd-topology-updater.conf
 
 ### -no-publish
 
-The `-no-publish` flag disables all communication with the nfd-master, making
-it a "dry-run" flag for nfd-topology-updater. NFD-Topology-Updater runs
-resource hardware topology detection normally, but no CR requests are sent to
-nfd-master.
+The `-no-publish` flag makes for a "dry-run" flag for nfd-topology-updater.
+NFD-Topology-Updater runs resource hardware topology detection normally, but
+[NodeResourceTopology](../usage/custom-resources.md#noderesourcetopology)
+objects are not created or updated.
 
 Default: *false*
 
@@ -72,18 +72,31 @@ Example:
 nfd-topology-updater -oneshot -no-publish
 ```
 
-### -metrics
+### -kubeconfig
 
-The `-metrics` flag specifies the port on which to expose
-[Prometheus](https://prometheus.io/) metrics. Setting this to 0 disables the
-metrics server on nfd-topology-updater.
+The `-kubeconfig` flag specifies the path to a kubeconfig file to use for
+connecting to the Kubernetes API server. If not specified, the in-cluster
+configuration is used.
 
-Default: 8081
+Default: *empty*
 
 Example:
 
 ```bash
-nfd-topology-updater -metrics=12345
+nfd-topology-updater -kubeconfig=${HOME}/.kube/config
+```
+
+### -port
+
+The `-port` flag specifies the port on which metrics and healthz endpoints are
+served on.
+
+Default: 8080
+
+Example:
+
+```bash
+nfd-topology-updater -port=12345
 ```
 
 ### -sleep-interval
@@ -119,7 +132,10 @@ nfd-topology-updater -watch-namespace=rte
 ### -kubelet-config-uri
 
 The `-kubelet-config-uri` specifies the path to the Kubelet's configuration.
-Note that the URi could either be a local host file or an HTTP endpoint.
+Note that the URI can either be a local file (`file://` scheme, for example
+`file:///var/lib/kubelet/config.yaml`; a bare path without `file://` is
+rejected) or an HTTPS endpoint (`https://` scheme). Other schemes, including
+`http://`, are rejected at startup.
 
 Default:  `https://${NODE_ADDRESS}:10250/configz`
 
@@ -135,14 +151,16 @@ The `-api-auth-token-file` specifies the path to the api auth token file
 which is used to retrieve Kubelet's configuration from Kubelet secure port,
 only taking effect when `-kubelet-config-uri` is https.
 Note that this token file must bind to a role that has the `get` capability to
-`nodes/proxy` resources.
+`nodes/configz` resources (on 1.33+ nodes), or `get` `nodes/proxy` resources
+(prior to 1.33). See [warnings](https://kubernetes.io/docs/reference/access-authn-authz/kubelet-authn-authz/#get-nodes-proxy-warning)
+about granting `nodes/proxy` permissions.
 
 Default:  `/var/run/secrets/kubernetes.io/serviceaccount/token`
 
 Example:
 
 ```bash
-nfd-topology-updater -token-file=/var/run/secrets/kubernetes.io/serviceaccount/token
+nfd-topology-updater -api-auth-token-file=/var/run/secrets/kubernetes.io/serviceaccount/token
 ```
 
 ### -podresources-socket
@@ -164,12 +182,12 @@ nfd-topology-updater -podresources-socket=/var/lib/kubelet/pod-resources/kubelet
 Enables compute and report the pod set fingerprint in the NRT.
 A pod fingerprint is a compact representation of the "node state" regarding resources.
 
-Default: `false`
+Default: `true`
 
 Example:
 
 ```bash
-nfd-topology-updater -pods-fingerprint
+nfd-topology-updater -pods-fingerprint=false
 ```
 
 ### -kubelet-state-dir
@@ -187,3 +205,102 @@ Example:
 ```bash
 nfd-topology-updater -kubelet-state-dir=/var/lib/kubelet
 ```
+
+### Logging
+
+The following logging-related flags are inherited from the
+[klog](https://pkg.go.dev/k8s.io/klog/v2) package.
+
+#### -add_dir_header
+
+If true, adds the file directory to the header of the log messages.
+
+Default: false
+
+#### -alsologtostderr
+
+Log to standard error as well as files.
+
+Default: false
+
+#### -alsologtostderrthreshold
+
+Logs at or above this threshold go to stderr when -alsologtostderr=true (no
+effect when -logtostderr=true).
+
+Default: 0
+
+#### -legacy_stderr_threshold_behavior
+
+If true, stderrthreshold is ignored when logtostderr=true (legacy behavior). If
+false, stderrthreshold is honored even when logtostderr=true.
+
+Default: true
+
+#### -log_backtrace_at
+
+When logging hits line file:N, emit a stack trace.
+
+Default: *empty*
+
+#### -log_dir
+
+If non-empty, write log files in this directory.
+
+Default: *empty*
+
+#### -log_file
+
+If non-empty, use this log file.
+
+Default: *empty*
+
+#### -log_file_max_size
+
+Defines the maximum size a log file can grow to. Unit is megabytes. If the
+value is 0, the maximum file size is unlimited.
+
+Default: 1800
+
+#### -logtostderr
+
+Log to standard error instead of files
+
+Default: true
+
+#### -one_output
+
+If true, only write logs to their native severity level (vs also writing to
+each lower severity level; no effect when -logtostderr=true).
+
+Default: false
+
+#### -skip_headers
+
+If true, avoid header prefixes in the log messages.
+
+Default: false
+
+#### -skip_log_headers
+
+If true, avoid headers when opening log files.
+
+Default: false
+
+#### -stderrthreshold
+
+Logs at or above this threshold go to stderr.
+
+Default: 2
+
+#### -v
+
+Number for the log level verbosity.
+
+Default: 0
+
+#### -vmodule
+
+Comma-separated list of `pattern=N` settings for file-filtered logging.
+
+Default: *empty*

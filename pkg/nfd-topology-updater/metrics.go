@@ -17,59 +17,38 @@ limitations under the License.
 package nfdtopologyupdater
 
 import (
-	"fmt"
-	"net/http"
-
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"k8s.io/klog/v2"
 	"sigs.k8s.io/node-feature-discovery/pkg/version"
 )
 
 // When adding metric names, see https://prometheus.io/docs/practices/naming/#metric-names
 const (
-	buildInfoQuery  = "nfd_topology_updater_build_info"
-	scanErrorsQuery = "nfd_topology_updater_scan_errors_total"
+	buildInfoQuery  = "build_info"
+	scanErrorsQuery = "scan_errors_total"
+)
+
+const (
+	// nfdTopologyUpdaterPrefix - subsystem name used by nfd topology updater.
+	nfdTopologyUpdaterPrefix = "nfd_topology_updater"
 )
 
 var (
-	srv *http.Server
-
 	buildInfo = prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: buildInfoQuery,
-		Help: "Version from which Node Feature Discovery was built.",
+		Subsystem: nfdTopologyUpdaterPrefix,
+		Name:      buildInfoQuery,
+		Help:      "Version from which Node Feature Discovery was built.",
 		ConstLabels: map[string]string{
 			"version": version.Get(),
 		},
 	})
 	scanErrors = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: scanErrorsQuery,
-		Help: "Number of errors in scanning resource allocation of pods.",
+		Subsystem: nfdTopologyUpdaterPrefix,
+		Name:      scanErrorsQuery,
+		Help:      "Number of errors in scanning resource allocation of pods.",
 	})
 )
 
 // registerVersion exposes the Operator build version.
 func registerVersion(version string) {
 	buildInfo.SetToCurrentTime()
-}
-
-// runMetricsServer starts a http server to expose metrics
-func runMetricsServer(port int) {
-	r := prometheus.NewRegistry()
-	r.MustRegister(buildInfo,
-		scanErrors)
-	mux := http.NewServeMux()
-	mux.Handle("/metrics", promhttp.HandlerFor(r, promhttp.HandlerOpts{}))
-
-	klog.InfoS("metrics server starting", "port", port)
-	srv = &http.Server{Addr: fmt.Sprintf(":%d", port), Handler: mux}
-	klog.InfoS("metrics server stopped", "exitCode", srv.ListenAndServe())
-}
-
-// stopMetricsServer stops the metrics server
-func stopMetricsServer() {
-	if srv != nil {
-		klog.InfoS("stopping metrics server", "port", srv.Addr)
-		srv.Close()
-	}
 }

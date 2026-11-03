@@ -2,22 +2,39 @@
 
 this_dir=`dirname $0`
 
+# Tool versions
+GOLANGCI_LINT_VERSION="v2.14.0"
+# SHA-256 of golangci-lint-<version>-linux-amd64.tar.gz, from the release's
+# checksums file. Update it together with GOLANGCI_LINT_VERSION.
+GOLANGCI_LINT_SHA256="ab90aeb7b066f92a33415b638a50fe5344bbb75a0d32ad30cc248d88f81032ab"
+# The helm-unittest plugin installed by 'make helm-unittest' needs Helm v3.18.0
+# or later: its plugin.yaml uses the platformHooks field, which older Helm
+# versions reject.
+HELM_VERSION="v3.22.1"
+KUBECTL_VERSION="v1.22.1"
+
 # Install deps
 gobinpath="$(go env GOPATH)/bin"
-curl -sfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh| sh -s -- -b "$gobinpath" v1.54.0
+mkdir -p "$gobinpath"
+
+# golangci-lint's install.sh cannot install v2.13.0 or later: those checksums
+# files also list a .sbom.json per tarball, and its unanchored grep picks up
+# both lines. Fetch the tarball directly and check it against the pinned hash.
+gcl_name="golangci-lint-${GOLANGCI_LINT_VERSION#v}-linux-amd64"
+gcl_tmp="$(mktemp -d)"
+curl -sSfL -o "$gcl_tmp/$gcl_name.tar.gz" "https://github.com/golangci/golangci-lint/releases/download/$GOLANGCI_LINT_VERSION/$gcl_name.tar.gz"
+echo "$GOLANGCI_LINT_SHA256  $gcl_tmp/$gcl_name.tar.gz" | sha256sum -c -
+tar -xzf "$gcl_tmp/$gcl_name.tar.gz" -C "$gobinpath" --strip-components=1 "$gcl_name/golangci-lint"
+rm -rf "$gcl_tmp"
 export PATH=$PATH:$(go env GOPATH)/bin
 
-curl -sfL https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3 | bash -s -- --version v3.7.1
+curl -sfL https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3 | bash -s -- --version $HELM_VERSION
 
 kubectl="$gobinpath/kubectl"
-curl -L https://dl.k8s.io/release/v1.22.1/bin/linux/amd64/kubectl -o "$kubectl"
+curl -L https://dl.k8s.io/release/$KUBECTL_VERSION/bin/linux/amd64/kubectl -o "$kubectl"
 chmod 755 "$kubectl"
 
-curl https://keybase.io/codecovsecurity/pgp_keys.asc | gpg --no-default-keyring --keyring trustedkeys.gpg --import
-curl -Os https://uploader.codecov.io/latest/linux/codecov
-chmod +x codecov
-
-go install sigs.k8s.io/logtools/logcheck@v0.6.0
+go install sigs.k8s.io/logtools/logcheck@v0.10.1
 
 # Run verify steps
 echo "Checking gofmt"
@@ -29,20 +46,36 @@ make ci-lint
 echo "Running Helm lint"
 make helm-lint
 
+echo "Running Helm unit tests"
+make helm-unittest
+
 echo "Running logcheck"
 logcheck -config "${this_dir}/logcheck.conf" ./cmd/... ./pkg/...  ./source/...
 
 echo "Running unit tests"
 make test
 
-# Upload coverage report
-./codecov -t "${CODECOV_TOKEN}" \
-          -C "${PULL_PULL_SHA}" \
-          -r "${REPO_OWNER}/${REPO_NAME}" \
-          -P "${PULL_NUMBER}" \
-          -b "${BUILD_ID}" \
-          -B "${PULL_BASE_REF}" \
-          -N "${PULL_BASE_SHA}"
+# Upload coverage report (best-effort; coverage reporting must never gate CI).
+# The legacy Codecov uploader is deprecated and its download/key endpoints have
+# proven unreliable (e.g. the Keybase PGP key URL now returns a stub), so any
+# failure here is logged and treated as non-fatal. Migrating to the supported
+# Codecov CLI is tracked separately.
+upload_coverage() {
+    curl -Os https://uploader.codecov.io/latest/linux/codecov
+    chmod +x codecov
+    ./codecov -t "${CODECOV_TOKEN}" \
+              -C "${PULL_PULL_SHA}" \
+              -r "${REPO_OWNER}/${REPO_NAME}" \
+              -P "${PULL_NUMBER}" \
+              -b "${BUILD_ID}" \
+              -B "${PULL_BASE_REF}" \
+              -N "${PULL_BASE_SHA}"
+}
+
+echo "Uploading coverage report (best-effort, non-gating)"
+if ! upload_coverage; then
+    echo "WARNING: Codecov coverage upload failed; continuing because coverage reporting does not gate CI."
+fi
 
 # Check that repo is clean
 if ! git diff --quiet; then
@@ -66,3 +99,19 @@ for d in `ls deployment/overlays/* -d`; do
     echo "Verifying $d"
     kubectl kustomize $d > /dev/null
 done
+
+# Check that the Helm validation schema is in sync
+echo "Verifying Helm values schema"
+make helm-schema
+if ! git diff --quiet; then
+    echo "Helm validation schema is not in sync. Run 'make helm-generate' to update"
+    exit 1
+fi
+
+# Check that the Helm README is in sync
+echo "Verifying Helm README"
+make helm-docs
+if ! git diff --quiet; then
+    echo "Helm README is not in sync. Run 'make helm-generate' to update"
+    exit 1
+fi

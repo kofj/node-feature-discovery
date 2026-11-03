@@ -18,20 +18,22 @@ package nfdgarbagecollector
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
-	"github.com/k8stopologyawareschedwg/noderesourcetopology-api/pkg/apis/topology/v1alpha2"
-	topologyclientset "github.com/k8stopologyawareschedwg/noderesourcetopology-api/pkg/generated/clientset/versioned"
-	faketopologyv1alpha2 "github.com/k8stopologyawareschedwg/noderesourcetopology-api/pkg/generated/clientset/versioned/fake"
+	topologyv1alpha2 "github.com/k8stopologyawareschedwg/noderesourcetopology-api/pkg/apis/topology/v1alpha2"
+
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/sets"
-	"k8s.io/client-go/informers"
-	k8sclientset "k8s.io/client-go/kubernetes"
-	fakek8sclientset "k8s.io/client-go/kubernetes/fake"
-	fakenfdclientset "sigs.k8s.io/node-feature-discovery/pkg/generated/clientset/versioned/fake"
+	metadataclient "k8s.io/client-go/metadata"
+	"k8s.io/client-go/metadata/fake"
+	"k8s.io/client-go/metadata/metadatainformer"
+
+	nfdv1alpha1 "sigs.k8s.io/node-feature-discovery/api/nfd/v1alpha1"
 
 	. "github.com/smartystreets/goconvey/convey"
 )
@@ -40,10 +42,10 @@ func TestNRTGC(t *testing.T) {
 	Convey("When theres is old NRT ", t, func() {
 		gc := newMockGC(nil, []string{"node1"})
 
-		errChan := make(chan error, 1)
+		errChan := make(chan error)
 		go func() { errChan <- gc.Run() }()
 
-		So(waitForNRT(gc.topoClient), ShouldBeTrue)
+		So(gc.client, shouldEventuallyHaveNRTs)
 
 		gc.Stop()
 		So(<-errChan, ShouldBeNil)
@@ -51,10 +53,10 @@ func TestNRTGC(t *testing.T) {
 	Convey("When theres is one old NRT and one up to date", t, func() {
 		gc := newMockGC([]string{"node1"}, []string{"node1", "node2"})
 
-		errChan := make(chan error, 1)
+		errChan := make(chan error)
 		go func() { errChan <- gc.Run() }()
 
-		So(waitForNRT(gc.topoClient, "node1"), ShouldBeTrue)
+		So(gc.client, shouldEventuallyHaveNRTs, "node1")
 
 		gc.Stop()
 		So(<-errChan, ShouldBeNil)
@@ -62,92 +64,130 @@ func TestNRTGC(t *testing.T) {
 	Convey("Should react to delete event", t, func() {
 		gc := newMockGC([]string{"node1", "node2"}, []string{"node1", "node2"})
 
-		errChan := make(chan error, 1)
+		errChan := make(chan error)
 		go func() { errChan <- gc.Run() }()
 
-		err := gc.k8sClient.CoreV1().Nodes().Delete(context.TODO(), "node1", metav1.DeleteOptions{})
+		gvr := corev1.SchemeGroupVersion.WithResource("nodes")
+		err := gc.client.Resource(gvr).Delete(context.TODO(), "node1", metav1.DeleteOptions{})
 		So(err, ShouldBeNil)
 
-		So(waitForNRT(gc.topoClient, "node2"), ShouldBeTrue)
+		So(gc.client, shouldEventuallyHaveNRTs, "node2")
 	})
 	Convey("periodic GC should remove obsolete NRT", t, func() {
 		gc := newMockGC([]string{"node1", "node2"}, []string{"node1", "node2"})
 		// Override period to run fast
-		gc.gcPeriod = 100 * time.Millisecond
+		gc.args.GCPeriod = 100 * time.Millisecond
 
-		nrt := v1alpha2.NodeResourceTopology{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: "not-existing",
-			},
-		}
+		nrt := createPartialObjectMetadata("topology.node.k8s.io/v1alpha2", "NodeResourceTopology", "", "not-existing")
 
-		errChan := make(chan error, 1)
+		errChan := make(chan error)
 		go func() { errChan <- gc.Run() }()
 
-		_, err := gc.topoClient.TopologyV1alpha2().NodeResourceTopologies().Create(context.TODO(), &nrt, metav1.CreateOptions{})
+		gvr := topologyv1alpha2.SchemeGroupVersion.WithResource("noderesourcetopologies")
+		_, err := gc.client.Resource(gvr).(fake.MetadataClient).CreateFake(nrt, metav1.CreateOptions{})
 		So(err, ShouldBeNil)
 
-		So(waitForNRT(gc.topoClient, "node1", "node2"), ShouldBeTrue)
+		So(gc.client, shouldEventuallyHaveNRTs, "node1", "node2")
+	})
+}
+
+func TestDeleteNodeHandler(t *testing.T) {
+	Convey("When nfd-gc handles a Node delete event", t, func() {
+		gc := newMockGC([]string{"node1"}, []string{"node1"})
+		nf := createPartialObjectMetadata("nfd.k8s-sigs.io/v1alpha1", "NodeFeature", "nfd", "node1-features")
+		nf.Labels = map[string]string{nfdv1alpha1.NodeFeatureObjNodeNameLabel: "node1"}
+		_, err := gc.client.Resource(gvrNF).Namespace("nfd").(fake.MetadataClient).CreateFake(nf, metav1.CreateOptions{})
+		So(err, ShouldBeNil)
+		So(gc.startNodeInformer(), ShouldBeNil)
+		defer gc.Stop()
+
+		Convey("Objects are kept when a Node with the same name exists again", func() {
+			gc.deleteNodeHandler(createPartialObjectMetadata("v1", "Node", "", "node1"))
+
+			So(gc.client, shouldEventuallyHaveNRTs, "node1")
+			So(gc.client, shouldEventuallyHaveNodeFeatures, "node1-features")
+		})
+
+		Convey("Objects are deleted when the Node is gone", func() {
+			So(gc.client.Resource(gvrNode).Delete(context.TODO(), "node1", metav1.DeleteOptions{}), ShouldBeNil)
+
+			So(gc.client, shouldEventuallyHaveNRTs)
+			So(gc.client, shouldEventuallyHaveNodeFeatures)
+		})
 	})
 }
 
 func newMockGC(nodes, nrts []string) *mockGC {
-	k8sClient := fakek8sclientset.NewSimpleClientset(createFakeNodes(nodes...)...)
+	// Create fake objects
+	objs := []runtime.Object{}
+	for _, name := range nodes {
+		objs = append(objs, createPartialObjectMetadata("v1", "Node", "", name))
+	}
+	for _, name := range nrts {
+		objs = append(objs, createPartialObjectMetadata("topology.node.k8s.io/v1alpha2", "NodeResourceTopology", "", name))
+	}
+
+	scheme := fake.NewTestScheme()
+	_ = metav1.AddMetaToScheme(scheme)
+	cli := fake.NewSimpleMetadataClient(scheme, objs...)
 	return &mockGC{
 		nfdGarbageCollector: nfdGarbageCollector{
-			factory:    informers.NewSharedInformerFactory(k8sClient, 5*time.Minute),
-			nfdClient:  fakenfdclientset.NewSimpleClientset(),
-			topoClient: faketopologyv1alpha2.NewSimpleClientset(createFakeNRTs(nrts...)...),
-			stopChan:   make(chan struct{}, 1),
-			gcPeriod:   10 * time.Minute,
+			factory:  metadatainformer.NewSharedInformerFactory(cli, 0),
+			client:   cli,
+			stopChan: make(chan struct{}),
+			args: &Args{
+				GCPeriod: 10 * time.Minute,
+			},
 		},
-		k8sClient: k8sClient,
+		client: cli,
 	}
 }
 
-func createFakeNodes(names ...string) []runtime.Object {
-	nodes := make([]runtime.Object, len(names))
-	for i, n := range names {
-		nodes[i] = &corev1.Node{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: n,
-			}}
+func createPartialObjectMetadata(apiVersion, kind, namespace, name string) *metav1.PartialObjectMetadata {
+	return &metav1.PartialObjectMetadata{
+		APIVersion: apiVersion,
+		Kind:       kind,
+		Namespace:  namespace,
+		Name:       name,
 	}
-	return nodes
-}
-
-func createFakeNRTs(names ...string) []runtime.Object {
-	nrts := make([]runtime.Object, len(names))
-	for i, n := range names {
-		nrts[i] = &v1alpha2.NodeResourceTopology{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: n,
-			}}
-	}
-	return nrts
 }
 
 type mockGC struct {
 	nfdGarbageCollector
 
-	k8sClient k8sclientset.Interface
+	client metadataclient.Interface
 }
 
-func waitForNRT(cli topologyclientset.Interface, names ...string) bool {
-	nameSet := sets.NewString(names...)
-	for i := 0; i < 2; i++ {
-		nrts, err := cli.TopologyV1alpha2().NodeResourceTopologies().List(context.TODO(), metav1.ListOptions{})
-		So(err, ShouldBeNil)
+func shouldEventuallyHaveNRTs(actualI any, expectedI ...any) string {
+	return shouldEventuallyHaveObjects(gvrNRT, actualI, expectedI...)
+}
 
-		nrtNames := sets.NewString()
-		for _, nrt := range nrts.Items {
-			nrtNames.Insert(nrt.Name)
+func shouldEventuallyHaveNodeFeatures(actualI any, expectedI ...any) string {
+	return shouldEventuallyHaveObjects(gvrNF, actualI, expectedI...)
+}
+
+func shouldEventuallyHaveObjects(gvr schema.GroupVersionResource, actualI any, expectedI ...any) string {
+	cli := actualI.(metadataclient.Interface)
+	expected := sets.Set[string]{}
+	for _, e := range expectedI {
+		expected.Insert(e.(string))
+	}
+	actual := sets.Set[string]{}
+	for range 2 {
+		rsp, err := cli.Resource(gvr).List(context.TODO(), metav1.ListOptions{})
+		if err != nil {
+			return fmt.Sprintf("failed to list: %v", err)
 		}
 
-		if nrtNames.Equal(nameSet) {
-			return true
+		actual = sets.New[string]()
+		for _, meta := range rsp.Items {
+			actual.Insert(meta.Name)
+		}
+
+		if actual.Equal(expected) {
+			return ""
 		}
 		time.Sleep(1 * time.Second)
 	}
-	return false
+	return fmt.Sprintf("Expected: %v\nActual: %v", sets.List(expected), sets.List(actual))
 }

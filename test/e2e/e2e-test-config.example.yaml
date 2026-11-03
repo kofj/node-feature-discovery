@@ -47,16 +47,12 @@ defaultFeatures:
     - "feature.node.kubernetes.io/cpu-pstate.status"
     - "feature.node.kubernetes.io/cpu-pstate.scaling_governor"
     - "feature.node.kubernetes.io/cpu-pstate.turbo"
-    - "feature.node.kubernetes.io/cpu-rdt.RDTCMT"
-    - "feature.node.kubernetes.io/cpu-rdt.RDTL3CA"
-    - "feature.node.kubernetes.io/cpu-rdt.RDTMBA"
-    - "feature.node.kubernetes.io/cpu-rdt.RDTMBM"
-    - "feature.node.kubernetes.io/cpu-rdt.RDTMON"
     - "feature.node.kubernetes.io/kernel-config.NO_HZ"
     - "feature.node.kubernetes.io/kernel-config.NO_HZ_FULL"
     - "feature.node.kubernetes.io/kernel-config.NO_HZ_IDLE"
     - "feature.node.kubernetes.io/kernel-config.PREEMPT"
     - "feature.node.kubernetes.io/kernel-selinux.enabled"
+    - "feature.node.kubernetes.io/kernel-kvm.enabled"
     - "feature.node.kubernetes.io/kernel-version.full"
     - "feature.node.kubernetes.io/kernel-version.major"
     - "feature.node.kubernetes.io/kernel-version.minor"
@@ -73,8 +69,6 @@ defaultFeatures:
     - "feature.node.kubernetes.io/system-os_release.VERSION_ID.major"
     - "feature.node.kubernetes.io/system-os_release.VERSION_ID.minor"
   annotationWhitelist:
-    - "nfd.node.kubernetes.io/master.version"
-    - "nfd.node.kubernetes.io/worker.version"
     - "nfd.node.kubernetes.io/feature-labels"
   nodes:
     - name: name-of-this-item  # name is purely informational

@@ -18,11 +18,14 @@ package pci
 
 import (
 	"fmt"
+	"slices"
 	"strings"
+
+	"maps"
 
 	"k8s.io/klog/v2"
 
-	nfdv1alpha1 "sigs.k8s.io/node-feature-discovery/pkg/apis/nfd/v1alpha1"
+	nfdv1alpha1 "sigs.k8s.io/node-feature-discovery/api/nfd/v1alpha1"
 	"sigs.k8s.io/node-feature-discovery/pkg/utils"
 	"sigs.k8s.io/node-feature-discovery/source"
 )
@@ -102,11 +105,7 @@ func (s *pciSource) GetLabels() (source.FeatureLabels, error) {
 		}
 	}
 	if len(configLabelFields) > 0 {
-		keys := []string{}
-		for key := range configLabelFields {
-			keys = append(keys, key)
-		}
-		klog.InfoS("ignoring invalid fields in deviceLabelFields", "invalidFieldNames", keys)
+		klog.InfoS("ignoring invalid fields in deviceLabelFields", "invalidFieldNames", slices.Collect(maps.Keys(configLabelFields)))
 	}
 	if len(deviceLabelFields) == 0 {
 		deviceLabelFields = []string{"class", "vendor"}
@@ -119,17 +118,17 @@ func (s *pciSource) GetLabels() (source.FeatureLabels, error) {
 		class := attrs["class"]
 		for _, white := range s.config.DeviceClassWhitelist {
 			if strings.HasPrefix(string(class), strings.ToLower(white)) {
-				devLabel := ""
+				var devLabel strings.Builder
 				for i, attr := range deviceLabelFields {
-					devLabel += attrs[attr]
+					devLabel.WriteString(attrs[attr])
 					if i < len(deviceLabelFields)-1 {
-						devLabel += "_"
+						devLabel.WriteString("_")
 					}
 				}
-				labels[devLabel+".present"] = true
+				labels[devLabel.String()+".present"] = true
 
 				if _, ok := attrs["sriov_totalvfs"]; ok {
-					labels[devLabel+".sriov.capable"] = true
+					labels[devLabel.String()+".sriov.capable"] = true
 				}
 				break
 			}
@@ -146,7 +145,7 @@ func (s *pciSource) Discover() error {
 	if err != nil {
 		return fmt.Errorf("failed to detect PCI devices: %s", err.Error())
 	}
-	s.features.Instances[DeviceFeature] = nfdv1alpha1.NewInstanceFeatures(devs)
+	s.features.Instances[DeviceFeature] = nfdv1alpha1.NewInstanceFeatures(devs...)
 
 	klog.V(3).InfoS("discovered features", "featureSource", s.Name(), "features", utils.DelayedDumper(s.features))
 

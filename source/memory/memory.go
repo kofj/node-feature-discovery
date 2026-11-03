@@ -17,15 +17,18 @@ limitations under the License.
 package memory
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/klog/v2"
 
-	nfdv1alpha1 "sigs.k8s.io/node-feature-discovery/pkg/apis/nfd/v1alpha1"
+	nfdv1alpha1 "sigs.k8s.io/node-feature-discovery/api/nfd/v1alpha1"
 	"sigs.k8s.io/node-feature-discovery/pkg/utils"
 	"sigs.k8s.io/node-feature-discovery/pkg/utils/hostpath"
 	"sigs.k8s.io/node-feature-discovery/source"
@@ -39,6 +42,12 @@ const NvFeature = "nv"
 
 // NumaFeature is the name of the feature set that holds all NUMA related features.
 const NumaFeature = "numa"
+
+// SwapFeature is the name of the feature set that holds all Swap related features.
+const SwapFeature = "swap"
+
+// HugePages is the name of the feature set that holds information about huge pages.
+const HugePages = "hugepages"
 
 // memorySource implements the FeatureSource and LabelSource interfaces.
 type memorySource struct {
@@ -68,6 +77,11 @@ func (s *memorySource) GetLabels() (source.FeatureLabels, error) {
 		labels["numa"] = true
 	}
 
+	// Swap
+	if isSwap, ok := features.Attributes[SwapFeature].Elements["enabled"]; ok && isSwap == "true" {
+		labels["swap"] = true
+	}
+
 	// NVDIMM
 	if len(features.Instances[NvFeature].Elements) > 0 {
 		labels["nv.present"] = true
@@ -93,11 +107,25 @@ func (s *memorySource) Discover() error {
 		s.features.Attributes[NumaFeature] = nfdv1alpha1.AttributeFeatureSet{Elements: numa}
 	}
 
+	// Detect Swap
+	if swap, err := detectSwap(); err != nil {
+		klog.ErrorS(err, "failed to detect Swap nodes")
+	} else {
+		s.features.Attributes[SwapFeature] = nfdv1alpha1.AttributeFeatureSet{Elements: swap}
+	}
+
 	// Detect NVDIMM
 	if nv, err := detectNv(); err != nil {
 		klog.ErrorS(err, "failed to detect nvdimm devices")
 	} else {
 		s.features.Instances[NvFeature] = nfdv1alpha1.InstanceFeatureSet{Elements: nv}
+	}
+
+	// Detect Huge Pages
+	if hp, err := detectHugePages(); err != nil {
+		klog.ErrorS(err, "failed to detect huge pages")
+	} else {
+		s.features.Attributes[HugePages] = nfdv1alpha1.AttributeFeatureSet{Elements: hp}
 	}
 
 	klog.V(3).InfoS("discovered features", "featureSource", s.Name(), "features", utils.DelayedDumper(s.features))
@@ -111,6 +139,20 @@ func (s *memorySource) GetFeatures() *nfdv1alpha1.Features {
 		s.features = nfdv1alpha1.NewFeatures()
 	}
 	return s.features
+}
+
+// detectSwap detects Swap node information
+func detectSwap() (map[string]string, error) {
+	procBasePath := hostpath.ProcDir.Path("swaps")
+	lines, err := getNumberOfNonEmptyLinesFromFile(procBasePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read swaps file: %w", err)
+	}
+	// /proc/swaps has a header row
+	// If there is more than a header then we assume we have swap.
+	return map[string]string{
+		"enabled": strconv.FormatBool(lines > 1),
+	}, nil
 }
 
 // detectNuma detects NUMA node information
@@ -150,6 +192,57 @@ func detectNv() ([]nfdv1alpha1.InstanceFeature, error) {
 	return info, nil
 }
 
+// detectHugePages checks whether huge pages are enabled on the node
+// and retrieves the configured huge page sizes.
+func detectHugePages() (map[string]string, error) {
+	hugePages := map[string]string{
+		"enabled": "false",
+	}
+
+	basePath := hostpath.SysfsDir.Path("kernel/mm/hugepages")
+	subdirs, err := os.ReadDir(basePath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return hugePages, nil
+		}
+		return nil, fmt.Errorf("unable to read huge pages size: %w", err)
+	}
+
+	for _, entry := range subdirs {
+		if !entry.IsDir() {
+			continue
+		}
+
+		totalPages, err := getHugePagesTotalCount(basePath, entry.Name())
+		if err != nil {
+			klog.ErrorS(err, "unable to read hugepages total count", "hugepages", entry.Name())
+		}
+		pageSize := strings.TrimRight(strings.TrimPrefix(entry.Name(), "hugepages-"), "kB")
+		quantity, err := resource.ParseQuantity(pageSize + "Ki")
+		if err != nil {
+			klog.ErrorS(err, "unable to parse quantity", "hugepages", entry.Name(), "pageSize", pageSize)
+			continue
+		}
+
+		hugePages[corev1.ResourceHugePagesPrefix+quantity.String()] = totalPages
+		if v, err := strconv.Atoi(totalPages); err == nil && v > 0 {
+			hugePages["enabled"] = "true"
+		}
+	}
+
+	return hugePages, nil
+}
+
+func getHugePagesTotalCount(basePath, dirname string) (string, error) {
+	totalPagesFile := filepath.Join(basePath, dirname, "nr_hugepages")
+	totalPages, err := os.ReadFile(totalPagesFile)
+	if err != nil {
+		return "", fmt.Errorf("unable to read total number of huge pages from the file: %s", totalPagesFile)
+	}
+
+	return strings.TrimSpace(string(totalPages)), nil
+}
+
 // ndDevAttrs is the list of sysfs files (under each nd device) that we're trying to read
 var ndDevAttrs = []string{"devtype", "mode"}
 
@@ -164,6 +257,20 @@ func readNdDeviceInfo(path string) nfdv1alpha1.InstanceFeature {
 		attrs[attrName] = strings.TrimSpace(string(data))
 	}
 	return *nfdv1alpha1.NewInstanceFeature(attrs)
+}
+
+func getNumberOfNonEmptyLinesFromFile(path string) (int, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	length := 0
+	for line := range strings.SplitSeq(string(data), "\n") {
+		if strings.TrimSpace(line) != "" {
+			length++
+		}
+	}
+	return length, nil
 }
 
 func init() {

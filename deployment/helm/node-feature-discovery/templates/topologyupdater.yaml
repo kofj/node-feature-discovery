@@ -12,6 +12,11 @@ metadata:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 spec:
+  revisionHistoryLimit: {{ .Values.topologyUpdater.revisionHistoryLimit }}
+  {{- with .Values.topologyUpdater.updateStrategy }}
+  updateStrategy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "node-feature-discovery.selectorLabels" . | nindent 6 }}
@@ -20,24 +25,75 @@ spec:
     metadata:
       labels:
         {{- include "node-feature-discovery.selectorLabels" . | nindent 8 }}
-        role: topology-updater
-      {{- with .Values.topologyUpdater.annotations }}
-      annotations:
+        {{- with .Values.topologyUpdater.labels }}
         {{- toYaml . | nindent 8 }}
-      {{- end }}
+        {{- end }}
+        role: topology-updater
+      annotations:
+        {{- if .Values.checksumValuesOnly }}
+        checksum/config: {{ .Values.topologyUpdater.config | toYaml | sha256sum }}
+        {{- else }}
+        checksum/config: {{ include (print $.Template.BasePath "/nfd-topologyupdater-conf.yaml") . | sha256sum }}
+        {{- end }}
+        {{- with .Values.topologyUpdater.annotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
     spec:
       serviceAccountName: {{ include "node-feature-discovery.topologyUpdater.serviceAccountName" . }}
-      dnsPolicy: ClusterFirstWithHostNet
-    {{- with .Values.imagePullSecrets }}
-      imagePullSecrets:
-        {{- toYaml . | nindent 8 }}
+      dnsPolicy: {{ .Values.topologyUpdater.dnsPolicy }}
+    {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
     {{- end }}
+      imagePullSecrets: {{ include "node-feature-discovery.imagePullSecrets" . }}
       securityContext:
         {{- toYaml .Values.topologyUpdater.podSecurityContext | nindent 8 }}
+      hostNetwork: {{ .Values.topologyUpdater.hostNetwork }}
+      {{- if kindIs "bool" .Values.topologyUpdater.hostUsers }}
+      hostUsers: {{ .Values.topologyUpdater.hostUsers }}
+      {{- end }}
+      {{- with .Values.topologyUpdater.initContainers }}
+      initContainers:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
       - name: topology-updater
         image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
         imagePullPolicy: "{{ .Values.image.pullPolicy }}"
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: http
+        {{- with .Values.topologyUpdater.livenessProbe.initialDelaySeconds }}
+          initialDelaySeconds: {{ . }}
+        {{- end }}
+        {{- with .Values.topologyUpdater.livenessProbe.failureThreshold }}
+          failureThreshold: {{ . }}
+        {{- end }}
+        {{- with .Values.topologyUpdater.livenessProbe.periodSeconds }}
+          periodSeconds: {{ . }}
+        {{- end }}
+        {{- with .Values.topologyUpdater.livenessProbe.timeoutSeconds }}
+          timeoutSeconds: {{ . }}
+        {{- end }}
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: http
+        {{- with .Values.topologyUpdater.readinessProbe.initialDelaySeconds }}
+          initialDelaySeconds: {{ . }}
+        {{- end }}
+        {{- with .Values.topologyUpdater.readinessProbe.failureThreshold }}
+          failureThreshold: {{ . }}
+        {{- end }}
+        {{- with .Values.topologyUpdater.readinessProbe.periodSeconds }}
+          periodSeconds: {{ . }}
+        {{- end }}
+        {{- with .Values.topologyUpdater.readinessProbe.timeoutSeconds }}
+          timeoutSeconds: {{ . }}
+        {{- end }}
+        {{- with .Values.topologyUpdater.readinessProbe.successThreshold }}
+          successThreshold: {{ . }}
+        {{- end }}
         env:
         - name: NODE_NAME
           valueFrom:
@@ -47,6 +103,9 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: status.hostIP
+      {{- with .Values.topologyUpdater.extraEnvs }}
+        {{- toYaml . | nindent 8 }}
+      {{- end}}
         command:
           - "nfd-topology-updater"
         args:
@@ -61,13 +120,8 @@ spec:
           {{- else }}
           - "-watch-namespace=*"
           {{- end }}
-          {{- if .Values.tls.enable }}
-          - "-ca-file=/etc/kubernetes/node-feature-discovery/certs/ca.crt"
-          - "-key-file=/etc/kubernetes/node-feature-discovery/certs/tls.key"
-          - "-cert-file=/etc/kubernetes/node-feature-discovery/certs/tls.crt"
-          {{- end }}
-          {{- if .Values.topologyUpdater.podSetFingerprint }}
-          - "-pods-fingerprint"
+          {{- if not .Values.topologyUpdater.podSetFingerprint }}
+          - "-pods-fingerprint=false"
           {{- end }}
           {{- if .Values.topologyUpdater.kubeletConfigPath | empty | not }}
           - "-kubelet-config-uri=file:///host-var/kubelet-config"
@@ -76,10 +130,13 @@ spec:
           # Disable kubelet state tracking by giving an empty path
           - "-kubelet-state-dir="
           {{- end }}
-          - -metrics={{ .Values.topologyUpdater.metricsPort | default "8081"}}
+          - "-port={{ .Values.topologyUpdater.port | default "8080"}}"
+          {{- with .Values.topologyUpdater.extraArgs }}
+          {{- toYaml . | nindent 10 }}
+          {{- end }}
         ports:
-          - name: metrics
-            containerPort: {{ .Values.topologyUpdater.metricsPort | default "8081"}}
+          - containerPort: {{ .Values.topologyUpdater.port | default "8080"}}
+            name: http
         volumeMounts:
         {{- if .Values.topologyUpdater.kubeletConfigPath | empty | not }}
         - name: kubelet-config
@@ -92,11 +149,6 @@ spec:
         {{- if .Values.topologyUpdater.kubeletStateDir | empty | not }}
         - name: kubelet-state-files
           mountPath: /host-var/lib/kubelet
-          readOnly: true
-        {{- end }}
-        {{- if .Values.tls.enable }}
-        - name: nfd-topology-updater-cert
-          mountPath: "/etc/kubernetes/node-feature-discovery/certs"
           readOnly: true
         {{- end }}
         - name: nfd-topology-updater-conf
@@ -134,12 +186,6 @@ spec:
           items:
             - key: nfd-topology-updater.conf
               path: nfd-topology-updater.conf
-      {{- if .Values.tls.enable }}
-      - name: nfd-topology-updater-cert
-        secret:
-          secretName: nfd-topology-updater-cert
-      {{- end }}
-
 
     {{- with .Values.topologyUpdater.nodeSelector }}
       nodeSelector:

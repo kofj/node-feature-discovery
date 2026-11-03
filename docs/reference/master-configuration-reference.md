@@ -40,9 +40,6 @@ other vendor or application specific namespaces for custom labels from the
 local and custom feature sources, even though these labels were denied using
 the `denyLabelNs` parameter.
 
-The same namespace control and this option applies to Extended Resources (created
-with `resourceLabels`), too.
-
 Default: *empty*
 
 Example:
@@ -54,13 +51,13 @@ extraLabelNs: ["added.ns.io","added.kubernets.io"]
 ## denyLabelNs
 `denyLabelNs` specifies a list of excluded
 label namespaces. By default, nfd-master allows creating labels in all
-namespaces, excluding `kubernetes.io` namespace and its sub-namespaces
-(i.e. `*.kubernetes.io`). However, you should note that
-`kubernetes.io` and its sub-namespaces are always denied.
+namespaces, excluding `kubernetes.io` and its sub-namespaces
+(`*.kubernetes.io`), except `feature.node.kubernetes.io`,
+`profile.node.kubernetes.io` and their sub-namespaces. `denyLabelNs` cannot
+lift the `kubernetes.io` restriction; a specific namespace can be allowed with
+`extraLabelNs`.
 This option can be used to exclude some vendors or application specific
 namespaces.
-Note that the namespaces `feature.node.kubernetes.io` and `profile.node.kubernetes.io`
-and their sub-namespaces are always allowed and cannot be denied.
 
 Default: *empty*
 
@@ -68,23 +65,6 @@ Example:
 
 ```yaml
 denyLabelNs: ["denied.ns.io","denied.kubernetes.io"]
-```
-
-## resourceLabels
-
-**DEPRECATED**: [NodeFeatureRule](../usage/custom-resources.md#nodefeaturerule)
-should be used for managing extended resources in NFD.
-
-The `resourceLabels` option specifies a list of features to be
-advertised as extended resources instead of labels. Features that have integer
-values can be published as Extended Resources by listing them in this option.
-
-Default: *empty*
-
-Example:
-
-```yaml
-resourceLabels: ["vendor-1.com/feature-1","vendor-2.io/feature-2"]
 ```
 
 ## enableTaints
@@ -100,8 +80,8 @@ enableTaints: true
 
 ## labelWhiteList
 `labelWhiteList` specifies a regular expression for filtering feature
-labels based on their name. Each label must match against the given reqular
-expression in order to be published.
+labels based on their name. Each label must match against the given regular
+expression or it will not be published.
 
 > ** NOTE:** The regular expression is only matches against the "basename" part
 > of the label, i.e. to the part of the name after '/'. The label namespace is
@@ -121,8 +101,6 @@ The `resyncPeriod` option specifies the NFD API controller resync period.
 The resync means nfd-master replaying all NodeFeature and NodeFeatureRule objects,
 thus effectively re-syncing all nodes in the cluster (i.e. ensuring labels, annotations,
 extended resources and taints are in place).
-Only has effect when the [NodeFeature](../usage/custom-resources.md#nodefeature)
-CRD API has been enabled with [`-enable-nodefeature-api`](master-commandline-reference.md#-enable-nodefeature-api).
 
 Default: 1 hour.
 
@@ -156,7 +134,7 @@ Example:
 
 ```yaml
 leaderElection:
-  leaseDurtation: 15s
+  leaseDuration: 15s
 ```
 
 ### leaderElection.renewDeadline
@@ -196,8 +174,6 @@ leaderElection:
 The `nfdApiParallelism` option can be used to specify the maximum
 number of concurrent node updates.
 
-It takes effect only when `-enable-nodefeature-api` has been set.
-
 Default: 10
 
 Example:
@@ -206,10 +182,26 @@ Example:
 nfdApiParallelism: 1
 ```
 
+## informerPageSize
+
+The `informerPageSize` option is used to control pagination
+during informer cache sync on nfd-master startup.
+This is useful to control load on api-server/etcd as listing
+NodeFeature objects can be expensive, especially in large clusters.
+
+Default: 200
+
+Example:
+
+```yaml
+informerPageSize: 50
+```
+
 ## klog
 
-The following options specify the logger configuration. Most of which can be
-dynamically adjusted at run-time.
+The following options specify the logger configuration. Changes take effect
+when nfd-master is restarted (dynamic run-time reconfiguration was dropped in
+NFD v0.17).
 
 > **NOTE:** The logger options can also be specified via command line flags
 > which take precedence over any corresponding config file options.
@@ -220,15 +212,26 @@ If true, adds the file directory to the header of the log messages.
 
 Default: `false`
 
-Run-time configurable: yes
-
 ### klog.alsologtostderr
 
 Log to standard error as well as files.
 
 Default: `false`
 
-Run-time configurable: yes
+### klog.alsologtostderrthreshold
+
+Logs at or above this threshold go to stderr when `alsologtostderr` is true (no
+effect when `logtostderr` is true).
+
+Default: `0`
+
+### klog.legacyStderrThresholdBehavior
+
+If true, `stderrthreshold` is ignored when `logtostderr` is true (legacy
+behavior). If false, `stderrthreshold` is honored even when `logtostderr` is
+true.
+
+Default: `true`
 
 ### klog.logBacktraceAt
 
@@ -236,23 +239,17 @@ When logging hits line file:N, emit a stack trace.
 
 Default: *empty*
 
-Run-time configurable: yes
-
 ### klog.logDir
 
 If non-empty, write log files in this directory.
 
 Default: *empty*
 
-Run-time configurable: no
-
 ### klog.logFile
 
 If non-empty, use this log file.
 
 Default: *empty*
-
-Run-time configurable: no
 
 ### klog.logFileMaxSize
 
@@ -261,15 +258,18 @@ value is 0, the maximum file size is unlimited.
 
 Default: `1800`
 
-Run-time configurable: no
-
 ### klog.logtostderr
 
 Log to standard error instead of files
 
 Default: `true`
 
-Run-time configurable: yes
+### klog.oneOutput
+
+If true, only write logs to their native severity level (vs also writing to
+each lower severity level; no effect when `logtostderr` is true).
+
+Default: `false`
 
 ### klog.skipHeaders
 
@@ -277,21 +277,15 @@ If true, avoid header prefixes in the log messages.
 
 Default: `false`
 
-Run-time configurable: yes
-
 ### klog.skipLogHeaders
 
 If true, avoid headers when opening log files.
 
 Default: `false`
 
-Run-time configurable: no
-
 ### klog.stderrthreshold
 
 Logs at or above this threshold go to stderr (default 2)
-
-Run-time configurable: yes
 
 ### klog.v
 
@@ -299,12 +293,118 @@ Number for the log level verbosity.
 
 Default: `0`
 
-Run-time configurable: yes
-
 ### klog.vmodule
 
 Comma-separated list of `pattern=N` settings for file-filtered logging.
 
 Default: *empty*
 
-Run-time configurable: yes
+## restrictions (EXPERIMENTAL)
+
+The following options specify the restrictions that can be applied by the
+nfd-master on the deployed Custom Resources in the cluster.
+
+### restrictions.nodeFeatureNamespaceSelector
+
+The `nodeFeatureNamespaceSelector` option specifies the NodeFeatures namespaces
+to watch, which can be selected by using `metav1.LabelSelector` as a type for
+this option. An empty value selects all namespaces to be watched.
+
+Default: *empty*
+
+Example:
+
+```yaml
+restrictions:
+  nodeFeatureNamespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: "node-feature-discovery"
+    matchExpressions:
+      - key: "kubernetes.io/metadata.name"
+        operator: "In"
+        values:
+          - "node-feature-discovery"
+```
+
+### restrictions.disableLabels
+
+The `disableLabels` option controls whether to allow creation of node labels
+from NodeFeature and NodeFeatureRule CRs or not.
+
+Default: false
+
+Example:
+
+```yaml
+restrictions:
+  disableLabels: true
+```
+
+### restrictions.disableExtendedResources
+
+The `disableExtendedResources` option controls whether to allow creation of
+node extended resources from NodeFeatureRule CR or not.
+
+Default: false
+
+Example:
+
+```yaml
+restrictions:
+  disableExtendedResources: true
+```
+
+### restrictions.disableAnnotations
+
+he `disableAnnotations` option controls whether to allow creation of node annotations
+from NodeFeatureRule CR or not.
+
+Default: false
+
+Example:
+
+```yaml
+restrictions:
+  disableAnnotations: true
+```
+
+### restrictions.allowOverwrite
+
+The `allowOverwrite` option controls whether NFD is allowed to overwrite and
+take over management of existing node labels, annotations, and extended resources.
+Labels, annotations and extended resources created by NFD itself are not affected
+(overwrite cannot be disabled). NFD tracks the labels, annotations and extended
+resources that it manages with specific
+[node annotations](../get-started/introduction.md#node-annotations).
+
+Default: true
+
+> **NOTE:** Currently `allowOverwrite: false` does not work as described above.
+> Existing node labels and annotations that were not created by NFD are still
+> overwritten, while value changes to labels and annotations that NFD already
+> manages are no longer applied, and the
+> `nfd.node.kubernetes.io/feature-labels` and
+> `nfd.node.kubernetes.io/feature-annotations` tracking annotations stop being
+> updated. Extended resources ignore this option and are always overwritten.
+> Keep the default (`true`).
+
+Example:
+
+```yaml
+restrictions:
+  allowOverwrite: false
+```
+
+### restrictions.denyNodeFeatureLabels
+
+The `denyNodeFeatureLabels` option specifies whether to deny labels from 3rd party
+NodeFeature objects or not. NodeFeature objects created by nfd-worker are not affected.
+
+Default: false
+
+Example:
+
+```yaml
+restrictions:
+  denyNodeFeatureLabels: true
+```

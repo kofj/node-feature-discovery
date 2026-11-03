@@ -23,10 +23,11 @@ import (
 	"time"
 
 	"k8s.io/klog/v2"
-	klogutils "sigs.k8s.io/node-feature-discovery/pkg/utils/klog"
 
+	"sigs.k8s.io/node-feature-discovery/pkg/features"
 	master "sigs.k8s.io/node-feature-discovery/pkg/nfd-master"
 	"sigs.k8s.io/node-feature-discovery/pkg/utils"
+	klogutils "sigs.k8s.io/node-feature-discovery/pkg/utils/klog"
 	"sigs.k8s.io/node-feature-discovery/pkg/version"
 )
 
@@ -40,51 +41,14 @@ func main() {
 
 	printVersion := flags.Bool("version", false, "Print version and exit.")
 
-	args, overrides := initFlags(flags)
-
-	_ = flags.Parse(os.Args[1:])
-	if len(flags.Args()) > 0 {
-		fmt.Fprintf(flags.Output(), "unknown command line argument: %s\n", flags.Args()[0])
-		flags.Usage()
-		os.Exit(2)
+	// Add FeatureGates flag
+	if err := features.NFDMutableFeatureGate.Add(features.DefaultNFDFeatureGates); err != nil {
+		klog.ErrorS(err, "failed to add default feature gates")
+		os.Exit(1)
 	}
+	features.NFDMutableFeatureGate.AddFlag(flags)
 
-	// Check deprecated flags
-	flags.Visit(func(f *flag.Flag) {
-		switch f.Name {
-		case "featurerules-controller":
-			klog.InfoS("-featurerules-controller is deprecated, use '-crd-controller' flag instead")
-		case "extra-label-ns":
-			args.Overrides.ExtraLabelNs = overrides.ExtraLabelNs
-		case "deny-label-ns":
-			args.Overrides.DenyLabelNs = overrides.DenyLabelNs
-		case "label-whitelist":
-			args.Overrides.LabelWhiteList = overrides.LabelWhiteList
-		case "resource-labels":
-			klog.InfoS("-resource-labels is deprecated, extended resources should be managed with NodeFeatureRule objects")
-			args.Overrides.ResourceLabels = overrides.ResourceLabels
-		case "enable-taints":
-			args.Overrides.EnableTaints = overrides.EnableTaints
-		case "no-publish":
-			args.Overrides.NoPublish = overrides.NoPublish
-		case "resync-period":
-			args.Overrides.ResyncPeriod = overrides.ResyncPeriod
-		case "nfd-api-parallelism":
-			args.Overrides.NfdApiParallelism = overrides.NfdApiParallelism
-		case "enable-nodefeature-api":
-			klog.InfoS("-enable-nodefeature-api is deprecated, will be removed in a future release along with the deprecated gRPC API")
-		case "ca-file":
-			klog.InfoS("-ca-file is deprecated, will be removed in a future release along with the deprecated gRPC API")
-		case "cert-file":
-			klog.InfoS("-cert-file is deprecated, will be removed in a future release along with the deprecated gRPC API")
-		case "key-file":
-			klog.InfoS("-key-file is deprecated, will be removed in a future release along with the deprecated gRPC API")
-		case "port":
-			klog.InfoS("-port is deprecated, will be removed in a future release along with the deprecated gRPC API")
-		case "verify-node-name":
-			klog.InfoS("-verify-node-name is deprecated, will be removed in a future release along with the deprecated gRPC API")
-		}
-	})
+	args := parseArgs(flags, os.Args[1:]...)
 
 	if *printVersion {
 		fmt.Println(ProgramName, version.Get())
@@ -93,14 +57,11 @@ func main() {
 
 	// Assert that the version is known
 	if version.Undefined() {
-		klog.InfoS("version not set! Set -ldflags \"-X sigs.k8s.io/node-feature-discovery/pkg/version.version=`git describe --tags --dirty --always`\" during build or run.")
+		klog.InfoS("version not set! Set -ldflags \"-X sigs.k8s.io/node-feature-discovery/pkg/version.version=`git describe --tags --dirty --always --match 'v*'`\" during build or run.")
 	}
 
-	// Plug klog into grpc logging infrastructure
-	utils.ConfigureGrpcKlog()
-
 	// Get new NfdMaster instance
-	instance, err := master.NewNfdMaster(args)
+	instance, err := master.NewNfdMaster(master.WithArgs(args))
 	if err != nil {
 		klog.ErrorS(err, "failed to initialize NfdMaster instance")
 		os.Exit(1)
@@ -112,42 +73,65 @@ func main() {
 	}
 }
 
+func parseArgs(flags *flag.FlagSet, osArgs ...string) *master.Args {
+	args, overrides := initFlags(flags)
+
+	filtered := osArgs[:0]
+	for _, a := range osArgs {
+		if len(a) > 0 {
+			filtered = append(filtered, a)
+		}
+	}
+
+	if len(filtered) == 0 {
+		return args
+	}
+
+	_ = flags.Parse(filtered)
+	if len(flags.Args()) > 0 {
+		_, _ = fmt.Fprintf(flags.Output(), "unknown command line argument: %s\n", flags.Args()[0])
+		flags.Usage()
+		os.Exit(2)
+	}
+
+	// Handle overrides
+	flags.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "extra-label-ns":
+			args.Overrides.ExtraLabelNs = overrides.ExtraLabelNs
+		case "deny-label-ns":
+			args.Overrides.DenyLabelNs = overrides.DenyLabelNs
+		case "label-whitelist":
+			args.Overrides.LabelWhiteList = overrides.LabelWhiteList
+		case "enable-taints":
+			args.Overrides.EnableTaints = overrides.EnableTaints
+		case "no-publish":
+			args.Overrides.NoPublish = overrides.NoPublish
+		case "resync-period":
+			args.Overrides.ResyncPeriod = overrides.ResyncPeriod
+		case "nfd-api-parallelism":
+			args.Overrides.NfdApiParallelism = overrides.NfdApiParallelism
+		case "informer-page-size":
+			args.Overrides.InformerPageSize = overrides.InformerPageSize
+		}
+	})
+
+	return args
+}
+
 func initFlags(flagset *flag.FlagSet) (*master.Args, *master.ConfigOverrideArgs) {
 	args := &master.Args{}
 
-	flagset.StringVar(&args.CaFile, "ca-file", "",
-		"Root certificate for verifying connections."+
-			" DEPRECATED: will be removed in a future release along with the deprecated gRPC API.")
-	flagset.StringVar(&args.CertFile, "cert-file", "",
-		"Certificate used for authenticating connections."+
-			" DEPRECATED: will be removed in a future release along with the deprecated gRPC API.")
 	flagset.StringVar(&args.Instance, "instance", "",
 		"Instance name. Used to separate annotation namespaces for multiple parallel deployments.")
-	flagset.StringVar(&args.KeyFile, "key-file", "",
-		"Private key matching -cert-file."+
-			" DEPRECATED: will be removed in a future release along with the deprecated gRPC API.")
 	flagset.StringVar(&args.ConfigFile, "config", "/etc/kubernetes/node-feature-discovery/nfd-master.conf",
 		"Config file to use.")
 	flagset.StringVar(&args.Kubeconfig, "kubeconfig", "",
 		"Kubeconfig to use")
-	flagset.BoolVar(&args.EnableNodeFeatureApi, "enable-nodefeature-api", true,
-		"Enable the NodeFeature CRD API for receiving node features. This will automatically disable the gRPC communication."+
-			" DEPRECATED: will be removed in a future release along with the deprecated gRPC API.")
-	flagset.BoolVar(&args.CrdController, "featurerules-controller", true,
-		"Enable NFD CRD API controller. DEPRECATED: use -crd-controller instead")
-	flagset.BoolVar(&args.CrdController, "crd-controller", true,
-		"Enable NFD CRD API controller for processing NodeFeature and NodeFeatureRule objects.")
 	flagset.IntVar(&args.Port, "port", 8080,
-		"Port on which to listen for gRPC connections."+
-			" DEPRECATED: will be removed in a future release along with the deprecated gRPC API.")
-	flagset.IntVar(&args.MetricsPort, "metrics", 8081,
-		"Port on which to expose metrics.")
+		"Port which metrics and healthz endpoints are served on")
 	flagset.BoolVar(&args.Prune, "prune", false,
 		"Prune all NFD related attributes from all nodes of the cluster and exit.")
-	flagset.BoolVar(&args.VerifyNodeName, "verify-node-name", false,
-		"Verify worker node name against the worker's TLS certificate. "+
-			"Only takes effect when TLS authentication has been enabled."+
-			" DEPRECATED: will be removed in a future release along with the deprecated gRPC API.")
 	flagset.StringVar(&args.Options, "options", "",
 		"Specify config options from command line. Config options are specified "+
 			"in the same format as in the config file (i.e. json or yaml). These options")
@@ -160,7 +144,6 @@ func initFlags(flagset *flag.FlagSet) (*master.Args, *master.ConfigOverrideArgs)
 		LabelWhiteList: &utils.RegexpVal{},
 		DenyLabelNs:    &utils.StringSetVal{},
 		ExtraLabelNs:   &utils.StringSetVal{},
-		ResourceLabels: &utils.StringSetVal{},
 		ResyncPeriod:   &utils.DurationVal{Duration: time.Duration(1) * time.Hour},
 	}
 	flagset.Var(overrides.ExtraLabelNs, "extra-label-ns",
@@ -174,13 +157,11 @@ func initFlags(flagset *flag.FlagSet) (*master.Args, *master.ConfigOverrideArgs)
 		"Do not publish feature labels")
 	flagset.Var(overrides.DenyLabelNs, "deny-label-ns",
 		"Comma separated list of denied label namespaces")
-	flagset.Var(overrides.ResourceLabels, "resource-labels",
-		"Comma separated list of labels to be exposed as extended resources. DEPRECATED: use NodeFeatureRule objects instead")
-	flagset.Var(overrides.ResyncPeriod, "resync-period",
-		"Specify the NFD API controller resync period."+
-			"It has an effect when the NodeFeature API has been enabled (with -enable-nodefeature-api).")
+	flagset.Var(overrides.ResyncPeriod, "resync-period", "Specify the NFD API controller resync period.")
 	overrides.NfdApiParallelism = flagset.Int("nfd-api-parallelism", 10, "Defines the maximum number of goroutines responsible of updating nodes. "+
-		"Can be used for the throttling mechanism. It has effect only when -enable-nodefeature-api has been set.")
+		"Can be used for the throttling mechanism.")
+	overrides.InformerPageSize = flagset.Int64("informer-page-size", 200,
+		"The list size to use when listing NodeFeature objects to sync informer cache.")
 
 	return args, overrides
 }

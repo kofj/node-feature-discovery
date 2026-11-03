@@ -21,9 +21,12 @@ import (
 	"flag"
 	"fmt"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
+
+	"maps"
 )
 
 // RegexpVal is a wrapper for regexp command line flags
@@ -40,32 +43,13 @@ func (a *RegexpVal) Set(val string) error {
 	return err
 }
 
-// UnmarshalJSON implements the Unmarshaler interface from "encoding/json"
-func (a *RegexpVal) UnmarshalJSON(data []byte) error {
-	var v interface{}
-	if err := json.Unmarshal(data, &v); err != nil {
-		return err
-	}
-	switch val := v.(type) {
-	case string:
-		if r, err := regexp.Compile(string(val)); err != nil {
-			return err
-		} else {
-			*a = RegexpVal{*r}
-		}
-	default:
-		return fmt.Errorf("invalid regexp %s", data)
-	}
-	return nil
-}
-
 // StringSetVal is a Value encapsulating a set of comma-separated strings
 type StringSetVal map[string]struct{}
 
 // Set implements the flag.Value interface
 func (a *StringSetVal) Set(val string) error {
 	m := map[string]struct{}{}
-	for _, n := range strings.Split(val, ",") {
+	for n := range strings.SplitSeq(val, ",") {
 		m[n] = struct{}{}
 	}
 	*a = m
@@ -77,10 +61,7 @@ func (a *StringSetVal) String() string {
 	if *a == nil {
 		return ""
 	}
-	vals := make([]string, 0, len(*a))
-	for val := range *a {
-		vals = append(vals, val)
-	}
+	vals := slices.Collect(maps.Keys(*a))
 	sort.Strings(vals)
 	return strings.Join(vals, ",")
 }
@@ -100,9 +81,16 @@ func (a *StringSetVal) UnmarshalJSON(data []byte) error {
 // StringSliceVal is a Value encapsulating a slice of comma-separated strings
 type StringSliceVal []string
 
-// Set implements the regexp.Value interface
+// Set implements the regexp.Value interface. Surrounding whitespace is trimmed
+// from each comma-separated entry and blank entries are dropped, so a value like
+// "cpu, pci" parses to ["cpu", "pci"] and "" parses to an empty slice.
 func (a *StringSliceVal) Set(val string) error {
-	*a = strings.Split(val, ",")
+	*a = nil
+	for s := range strings.SplitSeq(val, ",") {
+		if s = strings.TrimSpace(s); s != "" {
+			*a = append(*a, s)
+		}
+	}
 	return nil
 }
 
@@ -182,7 +170,7 @@ type DurationVal struct {
 
 // UnmarshalJSON implements the Unmarshaler interface from "encoding/json"
 func (d *DurationVal) UnmarshalJSON(data []byte) error {
-	var v interface{}
+	var v any
 	if err := json.Unmarshal(data, &v); err != nil {
 		return err
 	}

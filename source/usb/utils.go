@@ -18,6 +18,7 @@ package usb
 
 import (
 	"fmt"
+	"maps"
 	"os"
 	"path"
 	"path/filepath"
@@ -25,7 +26,7 @@ import (
 
 	"k8s.io/klog/v2"
 
-	nfdv1alpha1 "sigs.k8s.io/node-feature-discovery/pkg/apis/nfd/v1alpha1"
+	nfdv1alpha1 "sigs.k8s.io/node-feature-discovery/api/nfd/v1alpha1"
 	"sigs.k8s.io/node-feature-discovery/pkg/utils/hostpath"
 )
 
@@ -43,7 +44,7 @@ var devAttrFileMap = map[string]string{
 func readSingleUsbSysfsAttribute(path string) (string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return "", fmt.Errorf("failed to read device attribute %s: %v", filepath.Base(path), err)
+		return "", fmt.Errorf("failed to read device attribute %s: %w", filepath.Base(path), err)
 	}
 
 	attrVal := strings.TrimSpace(string(data))
@@ -90,9 +91,7 @@ func readUsbDevInfo(devPath string) ([]nfdv1alpha1.InstanceFeature, error) {
 			}
 
 			subdevAttrs := make(map[string]string, len(attrs))
-			for k, v := range attrs {
-				subdevAttrs[k] = v
-			}
+			maps.Copy(subdevAttrs, attrs)
 			subdevAttrs["class"] = attrVal
 
 			instances = append(instances, *nfdv1alpha1.NewInstanceFeature(subdevAttrs))

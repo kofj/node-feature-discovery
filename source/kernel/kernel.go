@@ -22,7 +22,7 @@ import (
 
 	"k8s.io/klog/v2"
 
-	nfdv1alpha1 "sigs.k8s.io/node-feature-discovery/pkg/apis/nfd/v1alpha1"
+	nfdv1alpha1 "sigs.k8s.io/node-feature-discovery/api/nfd/v1alpha1"
 	"sigs.k8s.io/node-feature-discovery/pkg/utils"
 	"sigs.k8s.io/node-feature-discovery/source"
 )
@@ -36,6 +36,7 @@ const (
 	SelinuxFeature       = "selinux"
 	VersionFeature       = "version"
 	EnabledModuleFeature = "enabledmodule"
+	KvmFeature           = "kvm"
 )
 
 // Configuration file options
@@ -122,7 +123,7 @@ func (s *kernelSource) Discover() error {
 	s.features = nfdv1alpha1.NewFeatures()
 
 	// Read kernel version
-	if version, err := parseVersion(); err != nil {
+	if version, err := discoverVersion(); err != nil {
 		klog.ErrorS(err, "failed to get kernel version")
 	} else {
 		s.features.Attributes[VersionFeature] = nfdv1alpha1.NewAttributeFeatures(version)
@@ -157,6 +158,13 @@ func (s *kernelSource) Discover() error {
 	} else {
 		s.features.Attributes[SelinuxFeature] = nfdv1alpha1.NewAttributeFeatures(nil)
 		s.features.Attributes[SelinuxFeature].Elements["enabled"] = strconv.FormatBool(selinux)
+	}
+
+	if kvm, err := KvmEnabled(); err != nil {
+		klog.ErrorS(err, "failed to detect kvm status")
+	} else {
+		s.features.Attributes[KvmFeature] = nfdv1alpha1.NewAttributeFeatures(nil)
+		s.features.Attributes[KvmFeature].Elements["enabled"] = strconv.FormatBool(kvm)
 	}
 
 	klog.V(3).InfoS("discovered features", "featureSource", s.Name(), "features", utils.DelayedDumper(s.features))

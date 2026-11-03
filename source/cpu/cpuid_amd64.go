@@ -17,10 +17,25 @@ limitations under the License.
 package cpu
 
 import (
+	"strconv"
+
 	"github.com/klauspost/cpuid/v2"
 )
 
 // getCpuidFlags returns feature names for all the supported CPU features.
 func getCpuidFlags() []string {
-	return cpuid.CPU.FeatureSet()
+	flags := cpuid.CPU.FeatureSet()
+	flags = append(flags, microarchLevelFlags(cpuid.CPU.X64Level())...)
+
+	return flags
+}
+
+func getCpuidAttributes() map[string]string {
+	ret := map[string]string{}
+
+	if cpuid.CPU.AVX10Level > 0 {
+		ret["AVX10_VERSION"] = strconv.Itoa(int(cpuid.CPU.AVX10Level))
+	}
+
+	return ret
 }

@@ -16,12 +16,13 @@ limitations under the License.
 
 package source
 
-//go:generate mockery --name=LabelSource --inpackage
+//go:generate go tool mockery --name=LabelSource --inpackage
 
 import (
+	"context"
 	"fmt"
 
-	nfdv1alpha1 "sigs.k8s.io/node-feature-discovery/pkg/apis/nfd/v1alpha1"
+	nfdv1alpha1 "sigs.k8s.io/node-feature-discovery/api/nfd/v1alpha1"
 )
 
 // Source is the base interface for all other source interfaces
@@ -77,15 +78,24 @@ type SupplementalSource interface {
 	DisableByDefault() bool
 }
 
+// EventSource is an interface for a source that can send events
+type EventSource interface {
+	FeatureSource
+
+	// SetNotifyChannel sets the notification channel used to send updates about feature changes.
+	// The provided channel will receive a notification (a pointer to the FeatureSource) whenever
+	// the source detects new or updated features, typically after a successful Discover operation.
+	SetNotifyChannel(ctx context.Context, ch chan *FeatureSource) error
+}
+
 // FeatureLabelValue represents the value of one feature label
-type FeatureLabelValue interface{}
+type FeatureLabelValue any
 
 // FeatureLabels is a collection of feature labels
 type FeatureLabels map[string]FeatureLabelValue
 
 // Config is the generic interface for source configuration data
-type Config interface {
-}
+type Config any
 
 // sources contain all registered sources
 var sources = make(map[string]Source)
@@ -155,6 +165,17 @@ func GetAllConfigurableSources() map[string]ConfigurableSource {
 	return all
 }
 
+// GetAllEventSources returns all registered event sources
+func GetAllEventSources() map[string]EventSource {
+	all := make(map[string]EventSource)
+	for k, v := range sources {
+		if s, ok := v.(EventSource); ok {
+			all[k] = s
+		}
+	}
+	return all
+}
+
 // GetAllFeatures returns a combined set of all features from all feature
 // sources.
 func GetAllFeatures() *nfdv1alpha1.Features {
@@ -164,25 +185,16 @@ func GetAllFeatures() *nfdv1alpha1.Features {
 		for k, v := range f.Flags {
 			// Prefix feature with the name of the source
 			k = n + "." + k
-			if typ := features.Exists(k); typ != "" {
-				panic(fmt.Sprintf("feature source %q returned flag feature %q which already exists (type %q)", n, k, typ))
-			}
 			features.Flags[k] = v
 		}
 		for k, v := range f.Attributes {
 			// Prefix feature with the name of the source
 			k = n + "." + k
-			if typ := features.Exists(k); typ != "" {
-				panic(fmt.Sprintf("feature source %q returned attribute feature %q which already exists (type %q)", n, k, typ))
-			}
 			features.Attributes[k] = v
 		}
 		for k, v := range f.Instances {
 			// Prefix feature with the name of the source
 			k = n + "." + k
-			if typ := features.Exists(k); typ != "" {
-				panic(fmt.Sprintf("feature source %q returned instance feature %q which already exists (type %q)", n, k, typ))
-			}
 			features.Instances[k] = v
 		}
 	}

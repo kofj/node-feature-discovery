@@ -1,3 +1,4 @@
+{{- if .Values.master.enable }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -12,6 +13,7 @@ metadata:
   {{- end }}
 spec:
   replicas: {{ .Values.master.replicaCount }}
+  revisionHistoryLimit: {{ .Values.master.revisionHistoryLimit }}
   selector:
     matchLabels:
       {{- include "node-feature-discovery.selectorLabels" . | nindent 6 }}
@@ -20,63 +22,105 @@ spec:
     metadata:
       labels:
         {{- include "node-feature-discovery.selectorLabels" . | nindent 8 }}
+        {{- with .Values.master.labels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
         role: master
-      {{- with .Values.master.annotations }}
       annotations:
+        {{- if .Values.checksumValuesOnly }}
+        checksum/config: {{ .Values.master.config | toYaml | sha256sum }}
+        {{- else }}
+        checksum/config: {{ include (print $.Template.BasePath "/nfd-master-conf.yaml") . | sha256sum }}
+        {{- end }}
+        {{- with .Values.master.annotations }}
         {{- toYaml . | nindent 8 }}
-      {{- end }}
+        {{- end }}
     spec:
-    {{- with .Values.imagePullSecrets }}
-      imagePullSecrets:
-        {{- toYaml . | nindent 8 }}
+      dnsPolicy: {{ .Values.master.dnsPolicy }}
+    {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
     {{- end }}
+      imagePullSecrets: {{ include "node-feature-discovery.imagePullSecrets" . }}
       serviceAccountName: {{ include "node-feature-discovery.master.serviceAccountName" . }}
       enableServiceLinks: false
       securityContext:
         {{- toYaml .Values.master.podSecurityContext | nindent 8 }}
+      hostNetwork: {{ .Values.master.hostNetwork }}
+      {{- if kindIs "bool" .Values.master.hostUsers }}
+      hostUsers: {{ .Values.master.hostUsers }}
+      {{- end }}
+      {{- with .Values.master.initContainers }}
+      initContainers:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: master
           securityContext:
             {{- toYaml .Values.master.securityContext | nindent 12 }}
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          {{- with .Values.master.startupProbe.initialDelaySeconds }}
+            initialDelaySeconds: {{ . }}
+          {{- end }}
+          {{- with .Values.master.startupProbe.failureThreshold }}
+            failureThreshold: {{ . }}
+          {{- end }}
+          {{- with .Values.master.startupProbe.periodSeconds }}
+            periodSeconds: {{ . }}
+          {{- end }}
+          {{- with .Values.master.startupProbe.timeoutSeconds }}
+            timeoutSeconds: {{ . }}
+          {{- end }}
           livenessProbe:
-            exec:
-              command:
-              - "/usr/bin/grpc_health_probe"
-              - "-addr=:{{ .Values.master.port | default "8080" }}"
-              {{- if .Values.tls.enable }}
-              - "-tls"
-              - "-tls-ca-cert=/etc/kubernetes/node-feature-discovery/certs/ca.crt"
-              - "-tls-client-key=/etc/kubernetes/node-feature-discovery/certs/tls.key"
-              - "-tls-client-cert=/etc/kubernetes/node-feature-discovery/certs/tls.crt"
-              {{- end }}
-            initialDelaySeconds: 10
-            periodSeconds: 10
+            httpGet:
+              path: /healthz
+              port: http
+          {{- with .Values.master.livenessProbe.initialDelaySeconds }}
+            initialDelaySeconds: {{ . }}
+          {{- end }}
+          {{- with .Values.master.livenessProbe.failureThreshold }}
+            failureThreshold: {{ . }}
+          {{- end }}
+          {{- with .Values.master.livenessProbe.periodSeconds }}
+            periodSeconds: {{ . }}
+          {{- end }}
+          {{- with .Values.master.livenessProbe.timeoutSeconds }}
+            timeoutSeconds: {{ . }}
+          {{- end }}
           readinessProbe:
-            exec:
-              command:
-              - "/usr/bin/grpc_health_probe"
-              - "-addr=:{{ .Values.master.port | default "8080" }}"
-              {{- if .Values.tls.enable }}
-              - "-tls"
-              - "-tls-ca-cert=/etc/kubernetes/node-feature-discovery/certs/ca.crt"
-              - "-tls-client-key=/etc/kubernetes/node-feature-discovery/certs/tls.key"
-              - "-tls-client-cert=/etc/kubernetes/node-feature-discovery/certs/tls.crt"
-              {{- end }}
-            initialDelaySeconds: 5
-            periodSeconds: 10
-            failureThreshold: 10
+            httpGet:
+              path: /healthz
+              port: http
+          {{- with .Values.master.readinessProbe.initialDelaySeconds }}
+            initialDelaySeconds: {{ . }}
+          {{- end }}
+          {{- with .Values.master.readinessProbe.failureThreshold }}
+            failureThreshold: {{ . }}
+          {{- end }}
+          {{- with .Values.master.readinessProbe.periodSeconds }}
+            periodSeconds: {{ . }}
+          {{- end }}
+          {{- with .Values.master.readinessProbe.timeoutSeconds }}
+            timeoutSeconds: {{ . }}
+          {{- end }}
+          {{- with .Values.master.readinessProbe.successThreshold }}
+            successThreshold: {{ . }}
+          {{- end }}
           ports:
           - containerPort: {{ .Values.master.port | default "8080" }}
-            name: grpc
-          - containerPort: {{ .Values.master.metricsPort | default "8081" }}
-            name: metrics
+            name: http
           env:
           - name: NODE_NAME
             valueFrom:
               fieldRef:
                 fieldPath: spec.nodeName
+        {{- with .Values.master.extraEnvs }}
+          {{- toYaml . | nindent 10 }}
+        {{- end}}
           command:
             - "nfd-master"
           resources:
@@ -85,12 +129,8 @@ spec:
             {{- if .Values.master.instance | empty | not }}
             - "-instance={{ .Values.master.instance }}"
             {{- end }}
-            - "-port={{ .Values.master.port | default "8080" }}"
-            {{- if .Values.enableNodeFeatureApi }}
-            - "-enable-nodefeature-api"
-            {{- if  gt (int .Values.master.replicaCount) 1 }}
+            {{- if gt (int .Values.master.replicaCount) 1 }}
             - "-enable-leader-election"
-            {{- end }}
             {{- end }}
             {{- if .Values.master.extraLabelNs | empty | not }}
             - "-extra-label-ns={{- join "," .Values.master.extraLabelNs }}"
@@ -98,20 +138,8 @@ spec:
             {{- if .Values.master.denyLabelNs | empty | not }}
             - "-deny-label-ns={{- join "," .Values.master.denyLabelNs }}"
             {{- end }}
-            {{- if .Values.master.resourceLabels | empty | not }}
-            - "-resource-labels={{- join "," .Values.master.resourceLabels }}"
-            {{- end }}
             {{- if .Values.master.enableTaints }}
             - "-enable-taints"
-            {{- end }}
-            {{- if .Values.master.crdController | kindIs "invalid" | not }}
-            - "-crd-controller={{ .Values.master.crdController }}"
-            {{- else }}
-            ## By default, disable crd controller for other than the default instances
-            - "-crd-controller={{ .Values.master.instance | empty }}"
-            {{- end }}
-            {{- if .Values.master.featureRulesController | kindIs "invalid" | not }}
-            - "-featurerules-controller={{ .Values.master.featureRulesController }}"
             {{- end }}
             {{- if .Values.master.resyncPeriod }}
             - "-resync-period={{ .Values.master.resyncPeriod }}"
@@ -119,27 +147,19 @@ spec:
             {{- if .Values.master.nfdApiParallelism | empty | not }}
             - "-nfd-api-parallelism={{ .Values.master.nfdApiParallelism }}"
             {{- end }}
-            {{- if .Values.tls.enable }}
-            - "-ca-file=/etc/kubernetes/node-feature-discovery/certs/ca.crt"
-            - "-key-file=/etc/kubernetes/node-feature-discovery/certs/tls.key"
-            - "-cert-file=/etc/kubernetes/node-feature-discovery/certs/tls.crt"
+            # Go over featureGates and add the feature-gate flag
+            {{- range $key, $value := .Values.featureGates }}
+            - "-feature-gates={{ $key }}={{ $value }}"
             {{- end }}
-            - "-metrics={{ .Values.master.metricsPort  | default "8081" }}"
+            - "-port={{ .Values.master.port | default "8080" }}"
+            {{- with .Values.master.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           volumeMounts:
-            {{- if .Values.tls.enable }}
-            - name: nfd-master-cert
-              mountPath: "/etc/kubernetes/node-feature-discovery/certs"
-              readOnly: true
-            {{- end }}
             - name: nfd-master-conf
               mountPath: "/etc/kubernetes/node-feature-discovery"
               readOnly: true
       volumes:
-        {{- if .Values.tls.enable }}
-        - name: nfd-master-cert
-          secret:
-            secretName: nfd-master-cert
-        {{- end }}
         - name: nfd-master-conf
           configMap:
             name: {{ include "node-feature-discovery.fullname" . }}-master-conf
@@ -158,3 +178,4 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
     {{- end }}
+{{- end }}

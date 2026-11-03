@@ -32,8 +32,15 @@ See [customizing the build](#customizing-the-build) below for altering the
 container image registry, for example.
 
 ```bash
-make
+make image
 ```
+
+This builds the minimal image variant,
+`<IMAGE_REGISTRY>/node-feature-discovery:<IMAGE_TAG_NAME>` (also tagged with a
+`-minimal` suffix), and the full variant,
+`<IMAGE_REGISTRY>/node-feature-discovery:<IMAGE_TAG_NAME>-full`. It also
+generates a `kustomization.yaml` in the root of the source tree (see
+[Deployment](#deployment) below).
 
 #### Push the container image
 
@@ -45,8 +52,9 @@ docker push <IMAGE_TAG>
 
 ### Docker multi-arch builds with buildx
 
-The default set of architectures enabled for mulit-arch builds are `linux/amd64`
-and `linux/arm64`. If more architectures are needed one can override the
+The architectures enabled by default for multi-arch builds are
+`linux/amd64`, `linux/arm64`, `linux/arm/v7`, `linux/s390x` and
+`linux/ppc64le`. If more architectures are needed one can override the
 `IMAGE_ALL_PLATFORMS` variable with a comma separated list of `OS/ARCH` tuples.
 
 #### Build the manifest-list with a container image per arch
@@ -55,9 +63,11 @@ and `linux/arm64`. If more architectures are needed one can override the
 make image-all
 ```
 
-Currently `docker` does not support loading of manifest-lists meaning the images
-are not shown when executing `docker images`, see:
-[buildx issue #59](https://github.com/docker/buildx/issues/59).
+`make image-all` builds with the `nfd-builder` buildx builder (docker-container
+driver, set up by `hack/init-buildx.sh`) and passes neither `--load` nor
+`--push`, so the images stay in the build cache and are not shown by
+`docker images`. Use `make push-all` to publish them (loading multi-platform
+images into the local image store requires the containerd image store).
 
 #### Push the manifest-list with container image per arch
 
@@ -79,8 +89,8 @@ attribute in the spec template(s) to the new location
 
 ### Deployment
 
-The `yamls` makefile generates a `kustomization.yaml` matching your locally
-built image and using the `deploy/overlays/default` deployment. See
+The `yamls` make target generates a `kustomization.yaml` matching your locally
+built image and using the `deployment/overlays/default` deployment. See
 [build customization](#customizing-the-build) below for configurability, e.g.
 changing the deployment namespace.
 
@@ -90,8 +100,7 @@ kubectl apply -k .
 ```
 
 You can use alternative deployment methods by modifying the auto-generated
-kustomization file. For example, deploying worker and master in the same pod by
-pointing to `deployment/overlays/default-combined`.
+kustomization file.
 
 ### Building locally
 
@@ -110,27 +119,28 @@ name of the resulting container image. The following are targeted targeted for
 build customization and they can be specified via environment variables or
 makefile overrides.
 
-| Variable                   | Description                                                       | Default value
-| -------------------------- | ----------------------------------------------------------------- | ----------- |
-| HOSTMOUNT_PREFIX           | Prefix of system directories for feature discovery (local builds) | / (*local builds*) /host- (*container builds*)
-| IMAGE_BUILD_CMD            | Command to build the image                                        | docker build
-| IMAGE_BUILD_EXTRA_OPTS     | Extra options to pass to build command                            | *empty*
-| IMAGE_BUILDX_CMD           | Command to build and push multi-arch images with buildx           | DOCKER_CLI_EXPERIMENTAL=enabled docker buildx build --platform=${IMAGE_ALL_PLATFORMS} --progress=auto --pull
-| IMAGE_ALL_PLATFORMS        | Comma separated list of OS/ARCH tuples for mulit-arch builds    | linux/amd64,linux/arm64
-| IMAGE_PUSH_CMD             | Command to push the image to remote registry                      | docker push
-| IMAGE_REGISTRY             | Container image registry to use                                   | registry.k8s.io/nfd
-| IMAGE_TAG_NAME             | Container image tag name                                          | &lt;nfd version&gt;
-| IMAGE_EXTRA_TAG_NAMES      | Additional container image tag(s) to create when building image   | *empty*
-| K8S_NAMESPACE              | nfd-master and nfd-worker namespace                               | node-feature-discovery
-| KUBECONFIG                 | Kubeconfig for running e2e-tests                                  | *empty*
-| E2E_TEST_CONFIG            | Parameterization file of e2e-tests (see [example][e2e-config-sample]) | *empty*
-| E2E_PULL_IF_NOT_PRESENT    | True-ish value makes the image pull policy IfNotPresent (to be used only in e2e tests) | false
-| OPENSHIFT                  | Non-empty value enables OpenShift specific support (currently only effective in e2e tests) | *empty*
+| Variable                   | Description                                                       | Default value |
+| -------------------------- | ----------------------------------------------------------------- | ------------- |
+| BASE_IMAGE_FULL            | Base image of the full image variant                              | debian:trixie-slim |
+| BASE_IMAGE_MINIMAL         | Base image of the minimal image variant                           | scratch |
+| BUILDER_IMAGE              | Go builder image for the container build (must be Debian-based)   | golang:1.27-trixie |
+| CONTAINER_RUN_CMD          | Command to run helper containers (docs build, mdlint)             | docker run |
+| GO_CMD                     | Go command used to build and test                                 | go |
+| HOSTMOUNT_PREFIX           | Prefix of system directories for feature discovery (local builds) | / (*local builds*) /host- (*container builds*) |
+| IMAGE_BUILD_CMD            | Command to build the image                                        | docker build |
+| IMAGE_BUILD_EXTRA_OPTS     | Extra options to pass to build command                            | *empty* |
+| IMAGE_BUILDX_CMD           | Command to build and push multi-arch images with buildx           | DOCKER_CLI_EXPERIMENTAL=enabled docker buildx build --builder=nfd-builder --platform=${IMAGE_ALL_PLATFORMS} --progress=auto --pull |
+| IMAGE_ALL_PLATFORMS        | Comma separated list of OS/ARCH tuples for multi-arch builds      | linux/amd64,linux/arm64,linux/arm/v7,linux/s390x,linux/ppc64le |
+| IMAGE_PUSH_CMD             | Command to push the image to remote registry                      | docker push |
+| IMAGE_REGISTRY             | Container image registry to use                                   | registry.k8s.io/nfd |
+| IMAGE_TAG_NAME             | Container image tag name                                          | &lt;nfd version&gt; |
+| IMAGE_EXTRA_TAG_NAMES      | Additional container image tag(s) to create when building image   | *empty* |
+| K8S_NAMESPACE              | nfd-master and nfd-worker namespace                               | node-feature-discovery |
 
 For example, to use a custom registry:
 
 ```bash
-make IMAGE_REGISTRY=<my custom registry uri>
+make image IMAGE_REGISTRY=<my custom registry uri>
 ```
 
 Or to specify a build tool different from Docker, It can be done in 2 ways:
@@ -138,22 +148,41 @@ Or to specify a build tool different from Docker, It can be done in 2 ways:
 1. via environment
 
     ```bash
-    IMAGE_BUILD_CMD="buildah bud" make
+    IMAGE_BUILD_CMD="buildah bud" make image
     ```
 
 1. by overriding the variable value
 
     ```bash
-    make  IMAGE_BUILD_CMD="buildah bud"
+    make image IMAGE_BUILD_CMD="buildah bud"
     ```
 
 ### Testing
 
-Unit tests are automatically run as part of the container image build. You can
-also run them manually in the source code tree by simply running:
+Unit tests are not run as part of the container image build (CI runs them via
+`scripts/test-infra/verify.sh`). Run them in the source code tree with:
 
 ```bash
 make test
+```
+
+The Helm chart has its own unit tests under
+`deployment/helm/node-feature-discovery/tests/`. Run them with:
+
+```bash
+make helm-unittest
+```
+
+This installs the [helm-unittest](https://github.com/helm-unittest/helm-unittest)
+plugin at `HELM_UNITTEST_VERSION` if it is not installed yet. An already
+installed plugin is used as is, whatever its version.
+
+The chart rendered with default values is compared against snapshots in
+`tests/__snapshot__/`. After an intended template change, review and refresh
+them with:
+
+```bash
+helm unittest -u deployment/helm/node-feature-discovery/
 ```
 
 End-to-end tests are built on top of the e2e test framework of Kubernetes, and,
@@ -164,80 +193,70 @@ cluster you need to specify the kubeconfig to be used:
 make e2e-test KUBECONFIG=$HOME/.kube/config
 ```
 
-## Running locally
+There are several environment variables that can be used to customize the
+e2e-tests:
 
-> ****DEPRECATED**: Running NFD locally is deprecated and will be removed in a
-> future release. It depends on the gRPC API which is deprecated and will be
-> removed in a future release. To run NFD locally, use the
-> `-enable-nodefeature-api=false` flag.
-
-You can run NFD locally, either directly on your host OS or in containers for
-testing and development purposes. This may be useful e.g. for checking
-features-detection.
+| Variable                   | Description                                                       | Default value |
+| -------------------------- | ----------------------------------------------------------------- | ------------- |
+| KUBECONFIG                 | Kubeconfig for running e2e-tests (use a disposable test cluster)  | $HOME/.kube/config |
+| E2E_TEST_CONFIG            | Parameterization file of e2e-tests (see [example][e2e-config-sample]) | *empty* |
+| E2E_PULL_IF_NOT_PRESENT    | True-ish value makes the image pull policy IfNotPresent (to be used only in e2e tests) | false |
+| E2E_TEST_FULL_IMAGE        | Run e2e-test also against the Full Image tag                      | false |
+| E2E_GINKGO_LABEL_FILTER    | Ginkgo label filter to use for running e2e tests                  | *empty* |
+| OPENSHIFT                  | Non-empty value enables OpenShift specific support (only affects e2e tests) | *empty* |
 
 ### NFD-Master
 
-When running as a standalone container labeling is expected to fail because
-Kubernetes API is not available. Thus, it is recommended to use `-no-publish`
-Also specify `-crd-controller=false` and `-enable-nodefeature-api=false`
-command line flags to disable CRD controller and enable gRPC. E.g.
+For development and debugging it is possible to run nfd-master as a stand-alone
+binary outside the cluster. The `-no-publish` flag can be used to prevent
+nfd-master making changes to the nodes. If `-no-publish` is not set, nfd-master
+also requires the `NODE_NAME` environment variable to be set for cleaning up
+stale annotations.
 
 ```bash
-$ export NFD_CONTAINER_IMAGE={{ site.container_image }}
-$ docker run --rm --name=nfd-test ${NFD_CONTAINER_IMAGE} nfd-master -no-publish -crd-controller=false -enable-nodefeature-api=false
-2019/02/01 14:48:21 Node Feature Discovery Master <NFD_VERSION>
-2019/02/01 14:48:21 gRPC server serving on port: 8080
+make build
+NODE_NAME=<EXISTING_NODE> ./bin/nfd-master -no-publish -kubeconfig ~/.kube/config
 ```
 
 ### NFD-Worker
 
-In order to run nfd-worker as a "stand-alone" container
-you need to run it in the same network namespace as the nfd-master container:
+For development and debugging it is possible to run nfd-worker as a stand-alone
+binary outside the cluster. The `-no-publish` flag can be used to prevent
+nfd-worker from creating NodeFeature objects in the target cluster. If the
+`-no-publish` is not set, nfd-worker also requires the `NODE_NAME` and
+`KUBERNETES_NAMESPACE` environment variables to be defined to create the
+NodeFeature object in the target cluster.
 
 ```bash
-$ docker run --rm --network=container:nfd-test ${NFD_CONTAINER_IMAGE} nfd-worker -enable-nodefeature-api=false
-2019/02/01 14:48:56 Node Feature Discovery Worker <NFD_VERSION>
-...
+make build
+KUBERNETES_NAMESPACE=default NODE_NAME=nonexistent-node ./bin/nfd-worker -kubeconfig ~/.kube/config
 ```
 
-If you just want to try out feature discovery without connecting to nfd-master,
-pass the `-no-publish` flag to nfd-worker.
-
-> **NOTE:** Some feature sources need certain directories and/or files from the
-> host mounted inside the NFD container. Thus, you need to provide Docker with
-> the correct `--volume` options in order for them to work correctly when run
-> stand-alone directly with `docker run`. See
-> the [default deployment](https://github.com/kubernetes-sigs/node-feature-discovery/blob/{{site.release}}/deployment/components/common/worker-mounts.yaml)
-> for up-to-date information about the required volume mounts.
+> **NOTE:** Running nfd-worker locally this way discovers and publishes
+> features of the local development system you're running nfd-worker on.
 
 ### NFD-Topology-Updater
 
-In order to run nfd-topology-updater as a "stand-alone" container
-you need to run it in with the `-no-publish` flag to disable communication to
-the Kubernetes apiserver.
+For development and debugging it is possible to run nfd-topology-updater as a
+stand-alone binary outside the cluster. However, it requires access to the
+kubelet's local pod-resources socket and the kubelet http api so in practice it
+needs to be run on a host acting as a Kubernetes node and thus running
+kubelet. The kubelet configuration is read from the URI given with
+`-kubelet-config-uri`, which supports `file://` (e.g.
+`file:///var/lib/kubelet/config.yaml`) and `https://` (the kubelet `/configz`
+endpoint on the secure port 10250, authenticated with the token from
+`-api-auth-token-file`). `http://` URIs such as the kubelet read-only port are
+not supported, and the read-only port does not serve `/configz`.
+Also, the `-no-publish` flag can be
+used to prevent nfd-topology-updater from creating NodeResourceTopology objects
+in the target cluster. If the `-no-publish` is not set, nfd-topology-updater
+also requires the `NODE_NAME` and `KUBERNETES_NAMESPACE` environment variables
+to be defined.
 
 ```bash
-$ docker run --rm ${NFD_CONTAINER_IMAGE} nfd-topology-updater -no-publish
-2019/02/01 14:48:56 Node Feature Discovery Topology Updater <NFD_VERSION>
-...
+make build
+KUBERNETES_NAMESPACE=default NODE_NAME=<this-node> ./bin/nfd-topology-updater -kubeconfig ~/.kube/config -kubelet-config-uri file:///var/lib/kubelet/config.yaml
 ```
-
-If you just want to try out feature discovery without connecting to nfd-master,
-pass the `-no-publish` flag to nfd-topology-updater.
-
-> **NOTE:** NFD topology updater needs certain directories and/or files from
-> the host mounted inside the NFD container. Thus, you need to provide Docker
-> with the correct `--volume` options in order for them to work correctly when
-> run stand-alone directly with `docker run`. See
-> the [template spec](https://github.com/kubernetes-sigs/node-feature-discovery/blob/{{site.release}}/deployment/components/topology-updater/topologyupdater-mounts.yaml)
-> for up-to-date information about the required volume mounts.
->
-> [PodResource API][podresource-api] is a prerequisite for
-> nfd-topology-updater.  Preceding Kubernetes v1.23, the `kubelet` must be
-> started with the following flag:
-> `--feature-gates=KubeletPodResourcesGetAllocatable=true`. Starting
-> Kubernetes v1.23, the `GetAllocatableResources` is enabled by default through
-> `KubeletPodResourcesGetAllocatable` [feature gate][feature-gate].
 
 ## Running with Tilt
 
@@ -248,6 +267,19 @@ manually but instead let the Tilt take care of it. Tiltfile is a configuration f
 for the Tilt and is located at the root directory. To develop NFD with Tilt, follow
 the steps below.
 
+> **NOTE:** The Tiltfile sets `default_registry('ttl.sh')`. If Tilt detects a
+> local registry in the cluster (the `local-registry-hosting` ConfigMap in
+> `kube-public`, which kind's
+> [local registry setup](https://kind.sigs.k8s.io/docs/user/local-registry/)
+> creates), it pushes images there and ignores `default_registry`. Without
+> such a registry, Tilt loads the image straight into the cluster where the
+> cluster supports it (for example kind or Docker Desktop). Only when neither
+> works, for example on a kubeadm cluster (context
+> `kubernetes-admin@kubernetes`, which the Tiltfile allows), does Tilt push
+> images built from your working tree to the public, anonymous ttl.sh
+> registry. Edit `default_registry()` in the Tiltfile if that is not
+> acceptable.
+
 ### Prerequisites
 
 1. Install [Docker](https://docs.docker.com/engine/install/)
@@ -256,19 +288,28 @@ the steps below.
 1. Install [kustomize](https://github.com/kubernetes-sigs/kustomize)
 1. Install [tilt](https://docs.tilt.dev/install.html)
 1. Create a local Kubernetes cluster
+    - Create a local image registry first, for example with kind's
+      [local registry setup](https://kind.sigs.k8s.io/docs/user/local-registry/)
+    - Create a Kubernetes cluster. Please note that docker containers will be
+      served as controller node and worker nodes, and NFD-worker will run as a
+      DaemonSet in nested container. Therefore, to make sure the NFD-worker can
+      discover the host features, the host folders "/boot" and "/lib" should be
+      mounted into worker node docker containers when creating the Kubernetes
+      cluster.
+1. Start up node feature discovery development environment
+    To start up your Tilt development environment, run at the root of your
+    local NFD codebase.
 
-To start up your Tilt development environment, just run
+    ```shell
+    tilt up
+    ```
 
-```shell
-tilt up
-```
-
-at the root of your local NFD codebase. Tilt will start a web interface in the
-localhost and port 10350. From the web interface, you are able to see how NFD worker
-and master are progressing,  watch their build and runtime logs. Once your code changes
-are saved locally, Tilt will notice it and re-build the container image from the
-current code, push the image to the registry and re-deploy NFD pods with the latest
-container image.
+    Tilt will start a web interface in the localhost and port 10350. From the
+    web interface, you are able to see how NFD worker and master are
+    progressing, watch their build and runtime logs. Once your code changes are
+    saved locally, Tilt will notice it and re-build the container image from
+    the current code, push the image to the registry and re-deploy NFD pods
+    with the latest container image.
 
 ### Environment variables
 
@@ -290,7 +331,7 @@ All documentation resides under the
 directory in the source tree. It is designed to be served as a html site by
 [GitHub Pages](https://pages.github.com/).
 
-Building the documentation is containerized in order to fix the build
+Building the documentation is containerized to fix the build
 environment. The recommended way for developing documentation is to run:
 
 ```bash
@@ -300,10 +341,9 @@ make site-serve
 This will build the documentation in a container and serve it under
 [localhost:4000/](http://localhost:4000/) making it easy to verify the results.
 Any changes made to the `docs/` will automatically re-trigger a rebuild and are
-reflected in the served content and can be inspected with a simple browser
-refresh.
+reflected in the served content and can be inspected with a browser refresh.
 
-In order to just build the html documentation run:
+To just build the html documentation run:
 
 ```bash
 make site-build
@@ -312,6 +352,6 @@ make site-build
 This will generate html documentation under `docs/_site/`.
 
 <!-- Links -->
-[e2e-config-sample]: https://github.com/kubernetes-sigs/node-feature-discovery/blob/{{site.release}}/test/e2e/e2e-test-config.exapmle.yaml
+[e2e-config-sample]: https://github.com/kubernetes-sigs/node-feature-discovery/blob/{{site.release}}/test/e2e/e2e-test-config.example.yaml
 [podresource-api]: https://kubernetes.io/docs/concepts/extend-kubernetes/compute-storage-net/device-plugins/#monitoring-device-plugin-resources
 [feature-gate]: https://kubernetes.io/docs/reference/command-line-tools-reference/feature-gates

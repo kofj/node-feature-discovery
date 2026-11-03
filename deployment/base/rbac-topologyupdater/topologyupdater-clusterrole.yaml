@@ -13,7 +13,13 @@ rules:
 - apiGroups:
   - ""
   resources:
-  - nodes/proxy
+  - namespaces
+  verbs:
+  - get
+- apiGroups:
+  - ""
+  resources:
+  - nodes/configz
   verbs:
   - get
 - apiGroups:
@@ -22,11 +28,20 @@ rules:
   - pods
   verbs:
   - get
+  - list
+  - watch
 - apiGroups:
   - topology.node.k8s.io
   resources:
   - noderesourcetopologies
   verbs:
   - create
+  - patch
+- apiGroups:
+  - apiextensions.k8s.io
+  resources:
+  - customresourcedefinitions
+  verbs:
   - get
-  - update
+  - list
+  - watch

@@ -46,7 +46,7 @@ import (
 	testpod "sigs.k8s.io/node-feature-discovery/test/e2e/utils/pod"
 )
 
-var _ = SIGDescribe("NFD topology updater", func() {
+var _ = NFDDescribe(Label("nfd-topology-updater"), func() {
 	var (
 		extClient                *extclient.Clientset
 		topologyClient           *topologyclientset.Clientset
@@ -71,8 +71,8 @@ var _ = SIGDescribe("NFD topology updater", func() {
 			Expect(err).NotTo(HaveOccurred())
 		}
 
-		By("Creating the node resource topologies CRD")
-		Expect(testutils.CreateNodeResourceTopologies(ctx, extClient)).ToNot(BeNil())
+		By("Ensuring the node resource topologies CRD exists without stale objects")
+		Expect(testutils.EnsureNodeResourceTopologies(ctx, extClient, topologyClient)).ToNot(BeNil())
 
 		By("Configuring RBAC")
 		Expect(testutils.ConfigureRBAC(ctx, f.ClientSet, f.Namespace.Name)).NotTo(HaveOccurred())
@@ -261,6 +261,44 @@ var _ = SIGDescribe("NFD topology updater", func() {
 				return true
 			}, time.Minute, 5*time.Second).Should(BeTrue(), "didn't get updated node topology info")
 		})
+
+		It("should check that that topology object is garbage colleted", func(ctx context.Context) {
+
+			By("Check if the topology object has owner reference")
+			ns, err := f.ClientSet.CoreV1().Namespaces().Get(ctx, f.Namespace.Name, metav1.GetOptions{})
+			Expect(err).NotTo(HaveOccurred())
+
+			t, err := topologyClient.TopologyV1alpha2().NodeResourceTopologies().Get(ctx, topologyUpdaterNode.Name, metav1.GetOptions{})
+			Expect(err).NotTo(HaveOccurred())
+
+			owned := false
+			for _, r := range t.OwnerReferences {
+				if r.UID == ns.UID {
+					owned = true
+					break
+				}
+			}
+			Expect(owned).Should(BeTrue())
+
+			By("Deleting the nfd-topology namespace")
+			err = f.ClientSet.CoreV1().Namespaces().Delete(ctx, f.Namespace.Name, metav1.DeleteOptions{})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("checking that topology was garbage collected")
+			Eventually(func() bool {
+				t, err := topologyClient.TopologyV1alpha2().NodeResourceTopologies().Get(ctx, topologyUpdaterNode.Name, metav1.GetOptions{})
+				if err != nil {
+					if apierrors.IsNotFound(err) {
+						framework.Logf("missing node topology resource for %q", topologyUpdaterNode.Name)
+						return false
+					}
+					framework.Logf("failed to get the node topology resource: %v", err)
+					return true
+				}
+				framework.Logf("topology resource: %v", t)
+				return true
+			}).WithPolling(15 * time.Second).WithTimeout(60 * time.Second).Should(BeFalse())
+		})
 	})
 
 	When("sleep interval disabled", func() {
@@ -364,6 +402,7 @@ excludeList:
 
 			podSpecOpts := []testpod.SpecOption{
 				testpod.SpecWithContainerImage(dockerImage()),
+				testpod.SpecWithContainerExtraArgs("-sleep-interval=5s"),
 				testpod.SpecWithConfigMap(cm.Name, "/etc/kubernetes/node-feature-discovery"),
 			}
 			topologyUpdaterDaemonSet = testds.NFDTopologyUpdater(kcfg, podSpecOpts...)
@@ -413,7 +452,7 @@ excludeList:
 				if err != nil {
 					if apierrors.IsNotFound(err) {
 						framework.Logf("missing node topology resource for %q", topologyUpdaterNode.Name)
-						return true // intentionally retry
+						return false
 					}
 					framework.Logf("failed to get the node topology resource: %v", err)
 					return false
@@ -436,6 +475,7 @@ excludeList:
 			podSpecOpts := []testpod.SpecOption{
 				testpod.SpecWithContainerImage(dockerImage()),
 				testpod.SpecWithContainerExtraArgs("-pods-fingerprint"),
+				testpod.SpecWithContainerExtraArgs("-sleep-interval=5s"),
 			}
 			topologyUpdaterDaemonSet = testds.NFDTopologyUpdater(kcfg, podSpecOpts...)
 		})

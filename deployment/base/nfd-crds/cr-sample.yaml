@@ -47,6 +47,9 @@ spec:
         - feature: kernel.selinux
           matchExpressions:
             enabled: {op: IsFalse}
+        - feature: kernel.kvm
+          matchExpressions:
+            enabled: {op: IsFalse}
         - feature: kernel.version
           matchExpressions:
             major: {op: In, value: ["5"]}
@@ -93,6 +96,13 @@ spec:
             matchExpressions:
               vendor: {op: In, value: ["8086"]}
               class: {op: In, value: ["02"]}
+
+    - name: "avx wildcard rule"
+      labels:
+        "my-avx-feature": "true"
+      matchFeatures:
+        - feature: cpu.cpuid
+          matchName: {op: InRegexp, value: ["^AVX512"]}
 
     # The following features demonstreate label templating capabilities
     - name: "my system template feature"
@@ -143,3 +153,11 @@ spec:
           matchExpressions:
             my.kernel.feature: {op: IsTrue}
             my.dummy.var: {op: Gt, value: ["0"]}
+
+    - name: "kconfig template rule"
+      labelsTemplate: |
+        {{ range .kernel.config }}kconfig-{{ .Name }}={{ .Value }}
+        {{ end }}
+      matchFeatures:
+        - feature: kernel.config
+          matchName: {op: In, value: ["SWAP", "X86", "ARM"]}

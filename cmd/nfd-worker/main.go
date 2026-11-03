@@ -22,10 +22,11 @@ import (
 	"os"
 
 	"k8s.io/klog/v2"
-	klogutils "sigs.k8s.io/node-feature-discovery/pkg/utils/klog"
 
+	"sigs.k8s.io/node-feature-discovery/pkg/features"
 	worker "sigs.k8s.io/node-feature-discovery/pkg/nfd-worker"
 	"sigs.k8s.io/node-feature-discovery/pkg/utils"
+	klogutils "sigs.k8s.io/node-feature-discovery/pkg/utils/klog"
 	"sigs.k8s.io/node-feature-discovery/pkg/version"
 )
 
@@ -39,6 +40,13 @@ func main() {
 
 	printVersion := flags.Bool("version", false, "Print version and exit.")
 
+	// Add FeatureGates flag
+	if err := features.NFDMutableFeatureGate.Add(features.DefaultNFDFeatureGates); err != nil {
+		klog.ErrorS(err, "failed to add default feature gates")
+		os.Exit(1)
+	}
+	features.NFDMutableFeatureGate.AddFlag(flags)
+
 	args := parseArgs(flags, os.Args[1:]...)
 
 	if *printVersion {
@@ -48,32 +56,11 @@ func main() {
 
 	// Assert that the version is known
 	if version.Undefined() {
-		klog.InfoS("version not set! Set -ldflags \"-X sigs.k8s.io/node-feature-discovery/pkg/version.version=`git describe --tags --dirty --always`\" during build or run.")
+		klog.InfoS("version not set! Set -ldflags \"-X sigs.k8s.io/node-feature-discovery/pkg/version.version=`git describe --tags --dirty --always --match 'v*'`\" during build or run.")
 	}
 
-	// Check deprecated flags
-	flags.Visit(func(f *flag.Flag) {
-		switch f.Name {
-		case "enable-nodefeature-api":
-			klog.InfoS("-enable-nodefeature-api is deprecated, will be removed in a future release along with the deprecated gRPC API")
-		case "ca-file":
-			klog.InfoS("-ca-file is deprecated, will be removed in a future release along with the deprecated gRPC API")
-		case "cert-file":
-			klog.InfoS("-cert-file is deprecated, will be removed in a future release along with the deprecated gRPC API")
-		case "key-file":
-			klog.InfoS("-key-file is deprecated, will be removed in a future release along with the deprecated gRPC API")
-		case "server":
-			klog.InfoS("-server is deprecated, will be removed in a future release along with the deprecated gRPC API")
-		case "server-name-override":
-			klog.InfoS("-server-name-override is deprecated, will be removed in a future release along with the deprecated gRPC API")
-		}
-	})
-
-	// Plug klog into grpc logging infrastructure
-	utils.ConfigureGrpcKlog()
-
 	// Get new NfdWorker instance
-	instance, err := worker.NewNfdWorker(args)
+	instance, err := worker.NewNfdWorker(worker.WithArgs(args))
 	if err != nil {
 		klog.ErrorS(err, "failed to initialize NfdWorker instance")
 		os.Exit(1)
@@ -90,7 +77,7 @@ func parseArgs(flags *flag.FlagSet, osArgs ...string) *worker.Args {
 
 	_ = flags.Parse(osArgs)
 	if len(flags.Args()) > 0 {
-		fmt.Fprintf(flags.Output(), "unknown command line argument: %s\n", flags.Args()[0])
+		_, _ = fmt.Fprintf(flags.Output(), "unknown command line argument: %s\n", flags.Args()[0])
 		flags.Usage()
 		os.Exit(2)
 	}
@@ -104,6 +91,12 @@ func parseArgs(flags *flag.FlagSet, osArgs ...string) *worker.Args {
 			args.Overrides.FeatureSources = overrides.FeatureSources
 		case "label-sources":
 			args.Overrides.LabelSources = overrides.LabelSources
+		case "no-publish-features":
+			args.Overrides.NoPublishFeatures = overrides.NoPublishFeatures
+		case "no-owner-refs":
+			args.Overrides.NoOwnerRefs = overrides.NoOwnerRefs
+		case "owner-refs":
+			args.Overrides.OwnerRefs = overrides.OwnerRefs
 		}
 	})
 
@@ -113,51 +106,44 @@ func parseArgs(flags *flag.FlagSet, osArgs ...string) *worker.Args {
 func initFlags(flagset *flag.FlagSet) (*worker.Args, *worker.ConfigOverrideArgs) {
 	args := &worker.Args{}
 
-	flagset.StringVar(&args.CaFile, "ca-file", "",
-		"Root certificate for verifying connections."+
-			" DEPRECATED: will be removed in a future release along with the deprecated gRPC API.")
-	flagset.StringVar(&args.CertFile, "cert-file", "",
-		"Certificate used for authenticating connections."+
-			" DEPRECATED: will be removed in a future release along with the deprecated gRPC API.")
 	flagset.StringVar(&args.ConfigFile, "config", "/etc/kubernetes/node-feature-discovery/nfd-worker.conf",
 		"Config file to use.")
-	flagset.StringVar(&args.KeyFile, "key-file", "",
-		"Private key matching -cert-file."+
-			" DEPRECATED: will be removed in a future release along with the deprecated gRPC API.")
-	flagset.BoolVar(&args.EnableNodeFeatureApi, "enable-nodefeature-api", true,
-		"Enable the NodeFeature CRD API for communicating with nfd-master. This will automatically disable the gRPC communication."+
-			" DEPRECATED: will be removed in a future release along with the deprecated gRPC API.")
 	flagset.StringVar(&args.Kubeconfig, "kubeconfig", "",
 		"Kubeconfig to use")
 	flagset.BoolVar(&args.Oneshot, "oneshot", false,
 		"Do not publish feature labels")
-	flagset.IntVar(&args.MetricsPort, "metrics", 8081,
-		"Port on which to expose metrics.")
+	flagset.IntVar(&args.Port, "port", 8080,
+		"Port on which to metrics and healthz endpoints are served")
 	flagset.StringVar(&args.Options, "options", "",
 		"Specify config options from command line. Config options are specified "+
 			"in the same format as in the config file (i.e. json or yaml). These options")
-	flagset.StringVar(&args.Server, "server", "localhost:8080",
-		"NFD server address to connecto to."+
-			" DEPRECATED: will be removed in a future release along with the deprecated gRPC API.")
-	flagset.StringVar(&args.ServerNameOverride, "server-name-override", "",
-		"Hostname expected from server certificate, useful in testing."+
-			" DEPRECATED: will be removed in a future release along with the deprecated gRPC API.")
 
 	args.Klog = klogutils.InitKlogFlags(flagset)
 
 	// Flags overlapping with config file options
 	overrides := &worker.ConfigOverrideArgs{
-		FeatureSources: &utils.StringSliceVal{},
-		LabelSources:   &utils.StringSliceVal{},
+		FeatureSources:    &utils.StringSliceVal{},
+		LabelSources:      &utils.StringSliceVal{},
+		NoPublishFeatures: &utils.StringSliceVal{},
+		OwnerRefs:         &worker.OwnerRefSources{"pod", "ds"},
 	}
 	overrides.NoPublish = flagset.Bool("no-publish", false,
 		"Do not publish discovered features, disable connection to nfd-master and don't create NodeFeature object.")
+	overrides.NoOwnerRefs = flagset.Bool("no-owner-refs", false,
+		"Do not set owner references for NodeFeature object (deprecated: use -owner-refs=).")
+	flagset.Var(overrides.OwnerRefs, "owner-refs",
+		"Comma separated list of NodeFeature owner reference sources: node, pod, ds. An empty value disables owner references.")
 	flagset.Var(overrides.FeatureSources, "feature-sources",
 		"Comma separated list of feature sources. Special value 'all' enables all sources. "+
 			"Prefix the source name with '-' to disable it.")
 	flagset.Var(overrides.LabelSources, "label-sources",
 		"Comma separated list of label sources. Special value 'all' enables all sources. "+
 			"Prefix the source name with '-' to disable it.")
+	flagset.Var(overrides.NoPublishFeatures, "no-publish-features",
+		"Comma separated list of feature keys to discover but omit from the published "+
+			"NodeFeature object (e.g. 'pci.device'). Suffix a key with '*' for a prefix "+
+			"match (e.g. 'pci.*'). Reduces object size; only use for features that no "+
+			"NodeFeatureRule or NodeFeatureGroup consumes.")
 
 	return args, overrides
 }

@@ -1,4 +1,4 @@
-.PHONY: all test templates yamls
+.PHONY: all test templates yamls build build-% install-crds
 .FORCE:
 
 GO_CMD ?= go
@@ -8,19 +8,22 @@ IMAGE_BUILD_CMD ?= docker build
 IMAGE_BUILD_EXTRA_OPTS ?=
 IMAGE_PUSH_CMD ?= docker push
 CONTAINER_RUN_CMD ?= docker run
-BUILDER_IMAGE ?= golang:1.20-bullseye
-BASE_IMAGE_FULL ?= debian:bullseye-slim
-BASE_IMAGE_MINIMAL ?= gcr.io/distroless/base
+BUILDER_IMAGE ?= golang:1.27-trixie
+BASE_IMAGE_FULL ?= debian:trixie-slim
+BASE_IMAGE_MINIMAL ?= scratch
 
 # Docker base command for working with html documentation.
 # Use host networking because 'jekyll serve' is stupid enough to use the
 # same site url than the "host" it binds to. Thus, all the links will be
 # broken if we'd bind to 0.0.0.0
-RUBY_IMAGE_VERSION := 3.1
+RUBY_IMAGE_VERSION := 3.4
+TOOOLCHAIN_MODE ?= $(shell $(GO_CMD) env GOVERSION)+auto
 JEKYLL_ENV ?= development
 SITE_BUILD_CMD := $(CONTAINER_RUN_CMD) --rm -i -u "`id -u`:`id -g`" \
 	$(shell [ -t 0 ] && echo '-t') \
 	-e JEKYLL_ENV=$(JEKYLL_ENV) \
+	-e JEKYLL_GITHUB_TOKEN="$$JEKYLL_GITHUB_TOKEN" \
+	$(shell [ "$(JEKYLL_ENV)" = "development" ] && echo '-e PAGES_DISABLE_NETWORK=1') \
 	--volume="$$PWD/docs:/work" \
 	--volume="$$PWD/docs/vendor/bundle:/usr/local/bundle" \
 	-w /work \
@@ -29,7 +32,12 @@ SITE_BASEURL ?=
 SITE_DESTDIR ?= _site
 JEKYLL_OPTS := -d '$(SITE_DESTDIR)' $(if $(SITE_BASEURL),-b '$(SITE_BASEURL)',)
 
-VERSION := $(shell git describe --tags --dirty --always)
+VERSION := $(shell git describe --tags --dirty --always --match "v*")
+
+CHART_VERSION ?= $(shell echo $(VERSION) | cut -c2-)
+CHART_EXTRA_VERSIONS ?=
+# helm-unittest v1.1.0 and later need Helm v3.18.0 or later
+HELM_UNITTEST_VERSION ?= v1.2.1
 
 IMAGE_REGISTRY ?= registry.k8s.io/nfd
 IMAGE_TAG_NAME ?= $(VERSION)
@@ -56,17 +64,20 @@ HOSTMOUNT_PREFIX ?= /
 KUBECONFIG ?= ${HOME}/.kube/config
 E2E_TEST_CONFIG ?=
 E2E_PULL_IF_NOT_PRESENT ?= false
+E2E_TEST_FULL_IMAGE ?= false
+E2E_GINKGO_LABEL_FILTER ?=
 
-LDFLAGS = -ldflags "-s -w -X sigs.k8s.io/node-feature-discovery/pkg/version.version=$(VERSION) -X sigs.k8s.io/node-feature-discovery/pkg/utils/hostpath.pathPrefix=$(HOSTMOUNT_PREFIX)"
+BUILD_FLAGS = -tags osusergo,netgo \
+              -ldflags "-s -w -extldflags=-static -X sigs.k8s.io/node-feature-discovery/pkg/version.version=$(VERSION) -X sigs.k8s.io/node-feature-discovery/pkg/utils/hostpath.pathPrefix=$(HOSTMOUNT_PREFIX)"
 
 # multi-arch build with buildx
-IMAGE_ALL_PLATFORMS ?= linux/amd64,linux/arm64
+IMAGE_ALL_PLATFORMS ?= linux/amd64,linux/arm64,linux/arm/v7,linux/s390x,linux/ppc64le
 
 # enable buildx
 ensure-buildx:
 	./hack/init-buildx.sh
 
-IMAGE_BUILDX_CMD ?= DOCKER_CLI_EXPERIMENTAL=enabled docker buildx build --platform=${IMAGE_ALL_PLATFORMS} --progress=auto --pull
+IMAGE_BUILDX_CMD ?= DOCKER_CLI_EXPERIMENTAL=enabled docker buildx build --builder=nfd-builder --platform=${IMAGE_ALL_PLATFORMS} --progress=auto --pull
 
 IMAGE_BUILD_ARGS = --build-arg VERSION=$(VERSION) \
                 --build-arg HOSTMOUNT_PREFIX=$(CONTAINER_HOSTMOUNT_PREFIX) \
@@ -87,12 +98,17 @@ IMAGE_BUILD_ARGS_MINIMAL = --target minimal \
 
 all: image
 
-build:
-	@mkdir -p bin
-	$(GO_CMD) build -v -o bin $(LDFLAGS) ./cmd/...
+BUILD_BINARIES := nfd-master nfd-worker nfd-topology-updater nfd-gc kubectl-nfd nfd
 
-install:
-	$(GO_CMD) install -v $(LDFLAGS) ./cmd/...
+build-%:
+	CGO_ENABLED=0 $(GO_CMD) build -v -o bin/ $(BUILD_FLAGS) ./cmd/$*
+
+build:	$(foreach bin, $(BUILD_BINARIES), build-$(bin))
+
+install-%:
+	$(GO_CMD) install -v $(BUILD_FLAGS) ./cmd/$*
+
+install:	$(foreach bin, $(BUILD_BINARIES), install-$(bin))
 
 image: yamls
 	$(IMAGE_BUILD_CMD) $(IMAGE_BUILD_ARGS) $(IMAGE_BUILD_ARGS_FULL)
@@ -103,6 +119,27 @@ image-all: ensure-buildx yamls
 	$(IMAGE_BUILDX_CMD) $(IMAGE_BUILD_ARGS) $(IMAGE_BUILD_ARGS_FULL)
 	$(IMAGE_BUILDX_CMD) $(IMAGE_BUILD_ARGS) $(IMAGE_BUILD_ARGS_MINIMAL)
 
+# Local cross-build smoke test for the full release matrix. Does NOT push;
+# does NOT --load. Exits non-zero on the first platform that fails to build.
+# Use to reproduce CI cross-build issues locally; leaves images named
+# nfd-cross-test:<plat> in the local cache for inspection (run
+# `docker image prune` or `docker rmi nfd-cross-test:*` to clean up).
+#
+# This recipe re-spells the docker buildx flags from IMAGE_BUILDX_CMD
+# rather than reusing the variable because IMAGE_BUILDX_CMD bakes in
+# --platform=$(IMAGE_ALL_PLATFORMS) (multi-arch in one invocation), and
+# we need a per-platform single-arch loop here. Keep the flags in sync
+# with IMAGE_BUILDX_CMD (line 78) if either changes. --pull is preserved
+# to match CI behaviour (fresh base images per smoke run).
+image-cross-test: ensure-buildx yamls
+	@for plat in $$(echo $(IMAGE_ALL_PLATFORMS) | tr , ' '); do \
+	  echo "===> $$plat"; \
+	  DOCKER_CLI_EXPERIMENTAL=enabled docker buildx build \
+	    --builder=nfd-builder --platform=$$plat --progress=auto --pull \
+	    $(IMAGE_BUILD_ARGS) --target minimal \
+	    -t nfd-cross-test:$$(echo $$plat | tr / -) . \
+	    || { echo "FAIL $$plat"; exit 1; }; \
+	done
 
 # clean NFD labels on all nodes
 # devel only
@@ -110,7 +147,6 @@ deploy-prune:
 	kubectl apply -k deployment/overlays/prune/
 	kubectl wait --for=condition=complete job -l app=nfd -n node-feature-discovery
 	kubectl delete -k deployment/overlays/prune/
-
 
 yamls:
 	@./hack/kustomize.sh $(K8S_NAMESPACE) $(IMAGE_REPO) $(IMAGE_TAG_NAME)
@@ -141,22 +177,23 @@ templates:
 	@rm nfd-worker.conf.tmp
 	@rm nfd-topology-updater.conf.tmp
 
+generate:
+	hack/update_codegen.sh
 
+.PHONY: generate-api-docs
+generate-api-docs: generate-api-docs-nfd
 
-.generator.image.stamp: Dockerfile_generator
-	$(IMAGE_BUILD_CMD) \
-	    --build-arg BUILDER_IMAGE=$(BUILDER_IMAGE) \
-	    -t nfd-generator \
-	    -f Dockerfile_generator .
-
-generate: .generator.image.stamp
-	$(CONTAINER_RUN_CMD) --rm \
-	    -v "`pwd`:/go/node-feature-discovery" \
-	    -v "`go env GOCACHE`:/.cache" \
-	    -v "`go env GOMODCACHE`:/go/pkg/mod" \
-	    --user=`id -u`:`id -g`\
-	    nfd-generator \
-	    ./hack/generate.sh
+.PHONY: generate-api-docs-nfd
+generate-api-docs-nfd:
+	$(GO_CMD) tool crd-ref-docs \
+		--source-path=./api/nfd/v1alpha1 \
+		--config=./hack/crd-ref-docs/config.yaml \
+		--templates-dir=./hack/crd-ref-docs/templates \
+		--max-depth=20 \
+		--renderer=markdown \
+		--output-path=./docs/reference/generated-nfd-api-reference.md
+	@# Add Jekyll front matter for site integration
+	@sed -i.bak '1s/^/---\ntitle: "NFD API Reference"\nlayout: default\nsort: 8\n---\n\n/' ./docs/reference/generated-nfd-api-reference.md && rm -f ./docs/reference/generated-nfd-api-reference.md.bak
 
 gofmt:
 	@$(GO_FMT) -w -l $$(find . -name '*.go')
@@ -182,28 +219,77 @@ mdlint:
 	ruby:slim \
 	/workdir/scripts/test-infra/mdlint.sh
 
+.PHONY: helm-generate
+helm-generate: helm-lint helm-docs helm-schema
+
+.PHONY: helm-schema
+helm-schema:
+	cd deployment/helm/node-feature-discovery/ && \
+	go tool helm-values-schema-json
+
+.PHONY: helm-docs
+helm-docs:
+	cd deployment/helm/node-feature-discovery/ && \
+	go tool helm-docs \
+	    -t README.md.gotmpl -t _metadata.gotmpl -t _templates.gotmpl \
+	    --sort-values-order file && \
+	go tool helm-docs \
+	    -t ../../../docs/deployment/helm.md.gotmpl -t _metadata-site.gotmpl -t _templates.gotmpl \
+	    --sort-values-order file \
+	    -o ../../../docs/deployment/helm.md
+
 helm-lint:
 	helm lint --strict deployment/helm/node-feature-discovery/
 
+.PHONY: helm-unittest
+helm-unittest:
+	@helm plugin list | grep -q '^unittest[[:space:]]' || \
+	    helm plugin install https://github.com/helm-unittest/helm-unittest --version $(HELM_UNITTEST_VERSION)
+	helm unittest deployment/helm/node-feature-discovery/
+
+helm-push:
+	for v in $(CHART_VERSION) $(CHART_EXTRA_VERSIONS); do \
+	    helm package deployment/helm/node-feature-discovery --version $$v --app-version $(IMAGE_TAG_NAME); \
+	    helm push node-feature-discovery-$$v.tgz oci://${IMAGE_REGISTRY}/charts; \
+	done
+	# Push artifacthub.io metadata
+	# Ref: https://artifacthub.io/docs/topics/repositories/helm-charts/#oci-support
+	oras push \
+	    ${IMAGE_REGISTRY}/charts/node-feature-discovery:artifacthub.io \
+	    --config /dev/null:application/vnd.cncf.artifacthub.config.v1+yaml \
+	    artifacthub-repo.yml:application/vnd.cncf.artifacthub.repository-metadata.layer.v1.yaml
+
+# TODO: Remove TOOOLCHAIN_MODE variable when fixed in upstream Go toolchain. Ref: https://github.com/golang/go/issues/75031
 test:
-	$(GO_CMD) test -covermode=atomic -coverprofile=coverage.out ./cmd/... ./pkg/... ./source/...
+	GOTOOLCHAIN=${TOOOLCHAIN_MODE} $(GO_CMD) test -covermode=atomic -coverprofile=coverage.out ./cmd/... ./pkg/... ./source/...
+	cd api/nfd && GOTOOLCHAIN=${TOOOLCHAIN_MODE} $(GO_CMD) test -covermode=atomic -coverprofile=coverage.out ./...
+
+install-crds:
+	@if [ ! -f "${KUBECONFIG}" ]; then echo "[ERR] KUBECONFIG file not found: ${KUBECONFIG}"; exit 1; fi
+	kubectl apply -f deployment/base/nfd-crds/nfd-api-crds.yaml
 
 e2e-test:
-	@if [ -z ${KUBECONFIG} ]; then echo "[ERR] KUBECONFIG missing, must be defined"; exit 1; fi
-	$(GO_CMD) test -v ./test/e2e/ -args -nfd.repo=$(IMAGE_REPO) -nfd.tag=$(IMAGE_TAG_NAME) \
+	@if [ ! -f "${KUBECONFIG}" ]; then echo "[ERR] KUBECONFIG file not found: ${KUBECONFIG}"; exit 1; fi
+	$(GO_CMD) test -timeout=1h -v ./test/e2e/ -args \
+	    -nfd.repo=$(IMAGE_REPO) -nfd.tag=$(IMAGE_TAG_NAME) \
 	    -kubeconfig=$(KUBECONFIG) \
 	    -nfd.e2e-config=$(E2E_TEST_CONFIG) \
 	    -nfd.pull-if-not-present=$(E2E_PULL_IF_NOT_PRESENT) \
-	    -ginkgo.focus="\[kubernetes-sigs\]" \
-	    -test.timeout=1h \
+	    -ginkgo.focus="\[k8s-sigs\/node-feature-discovery\]" \
+	    -ginkgo.label-filter=$(E2E_GINKGO_LABEL_FILTER) \
+	    -ginkgo.v \
 	    $(if $(OPENSHIFT),-nfd.openshift,)
-	$(GO_CMD) test -v ./test/e2e/ -args -nfd.repo=$(IMAGE_REPO) -nfd.tag=$(IMAGE_TAG_NAME)-full \
-	    -kubeconfig=$(KUBECONFIG) \
-	    -nfd.e2e-config=$(E2E_TEST_CONFIG) \
-	    -nfd.pull-if-not-present=$(E2E_PULL_IF_NOT_PRESENT) \
-	    -ginkgo.focus="\[kubernetes-sigs\]" \
-	    -test.timeout=1h \
-	    $(if $(OPENSHIFT),-nfd.openshift,)
+	if [ "$(E2E_TEST_FULL_IMAGE)" = "true" ]; then \
+	    $(GO_CMD) test -timeout=1h -v ./test/e2e/ -args \
+	        -nfd.repo=$(IMAGE_REPO) -nfd.tag=$(IMAGE_TAG_NAME)-full \
+	        -kubeconfig=$(KUBECONFIG) \
+	        -nfd.e2e-config=$(E2E_TEST_CONFIG) \
+	        -nfd.pull-if-not-present=$(E2E_PULL_IF_NOT_PRESENT) \
+	        -ginkgo.focus="\[k8s-sigs\/node-feature-discovery\]" \
+	        -ginkgo.label-filter=$(E2E_GINKGO_LABEL_FILTER) \
+	        -ginkgo.v \
+	        $(if $(OPENSHIFT),-nfd.openshift,); \
+	fi
 
 push:
 	$(IMAGE_PUSH_CMD) $(IMAGE_TAG)

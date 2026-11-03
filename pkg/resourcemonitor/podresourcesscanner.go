@@ -22,11 +22,13 @@ import (
 	"strconv"
 
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	client "k8s.io/client-go/kubernetes"
+	corev1listers "k8s.io/client-go/listers/core/v1"
 	"k8s.io/klog/v2"
 	podresourcesapi "k8s.io/kubelet/pkg/apis/podresources/v1"
-
-	"sigs.k8s.io/node-feature-discovery/pkg/apihelper"
+	"k8s.io/kubernetes/pkg/apis/core/v1/helper/qos"
 
 	"github.com/k8stopologyawareschedwg/noderesourcetopology-api/pkg/apis/topology/v1alpha2"
 	"github.com/k8stopologyawareschedwg/podfingerprint"
@@ -35,16 +37,26 @@ import (
 type PodResourcesScanner struct {
 	namespace         string
 	podResourceClient podresourcesapi.PodResourcesListerClient
-	apihelper         apihelper.APIHelpers
+	podLister         corev1listers.PodLister
+	k8sClient         client.Interface
 	podFingerprint    bool
 }
 
 // NewPodResourcesScanner creates a new ResourcesScanner instance
-func NewPodResourcesScanner(namespace string, podResourceClient podresourcesapi.PodResourcesListerClient, kubeApihelper apihelper.APIHelpers, podFingerprint bool) (ResourcesScanner, error) {
+func NewPodResourcesScanner(namespace string, podResourceClient podresourcesapi.PodResourcesListerClient, podLister corev1listers.PodLister, k8sClient client.Interface, podFingerprint bool) (ResourcesScanner, error) {
+	if k8sClient == nil {
+		return nil, fmt.Errorf("kubernetes client is required")
+	}
+
+	if podLister == nil {
+		return nil, fmt.Errorf("pod lister is required")
+	}
+
 	resourcemonitorInstance := &PodResourcesScanner{
 		namespace:         namespace,
 		podResourceClient: podResourceClient,
-		apihelper:         kubeApihelper,
+		podLister:         podLister,
+		k8sClient:         k8sClient,
 		podFingerprint:    podFingerprint,
 	}
 	if resourcemonitorInstance.namespace != "*" {
@@ -57,62 +69,61 @@ func NewPodResourcesScanner(namespace string, podResourceClient podresourcesapi.
 }
 
 // isWatchable tells if the the given namespace should be watched.
-func (resMon *PodResourcesScanner) isWatchable(podNamespace string, podName string, hasDevice bool) (bool, bool, error) {
-	cli, err := resMon.apihelper.GetClient()
-	if err != nil {
-		return false, false, err
-	}
-	pod, err := resMon.apihelper.GetPod(cli, podNamespace, podName)
-	if err != nil {
-		return false, false, err
+// In Scan(), if watchable is false, this pods scan will skip
+// so we can return directly if pod's namespace is not watchable
+func (resMon *PodResourcesScanner) isWatchable(ctx context.Context, podResource *podresourcesapi.PodResources) (bool, bool, error) {
+	if resMon.namespace != "*" && resMon.namespace != podResource.GetNamespace() {
+		return false, false, nil
 	}
 
-	isIntegralGuaranteed := hasExclusiveCPUs(pod)
+	ns := podResource.GetNamespace()
+	name := podResource.GetName()
 
-	if resMon.namespace == "*" && (isIntegralGuaranteed || hasDevice) {
-		return true, isIntegralGuaranteed, nil
+	pod, err := resMon.podLister.Pods(ns).Get(name)
+	if err != nil {
+		if !apierrors.IsNotFound(err) {
+			return false, false, err
+		}
+		// The informer cache can lag behind the kubelet PodResources API. Use a
+		// live GET to preserve topology correctness.
+		klog.InfoS("pod not in informer cache, falling back to GET", "namespace", ns, "podName", name)
+		pod, err = resMon.k8sClient.CoreV1().Pods(ns).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return false, false, err
+		}
 	}
-	// TODO:  add an explicit check for guaranteed pods and pods with devices
-	return resMon.namespace == podNamespace && (isIntegralGuaranteed || hasDevice), isIntegralGuaranteed, nil
+
+	isPodGuaranteed := qos.GetPodQOS(pod) == corev1.PodQOSGuaranteed
+	podHasExclusiveCPUs := isPodGuaranteed && checkPodExclusiveCPUs(pod)
+
+	return isPodGuaranteed || hasDevice(podResource), podHasExclusiveCPUs, nil
 }
 
-// hasExclusiveCPUs returns true if a guaranteed pod is allocated exclusive CPUs else returns false.
+// checkPodExclusiveCPUs returns true if a guaranteed pod is allocated exclusive CPUs else returns false.
 // In isWatchable() function we check for the pod QoS and proceed if it is guaranteed (i.e. request == limit)
 // and hence we only check for request in the function below.
-func hasExclusiveCPUs(pod *corev1.Pod) bool {
-	var totalCPU int64
-	var cpuQuantity resource.Quantity
+func checkPodExclusiveCPUs(pod *corev1.Pod) bool {
 	for _, container := range pod.Spec.InitContainers {
-
-		var ok bool
-		if cpuQuantity, ok = container.Resources.Requests[corev1.ResourceCPU]; !ok {
-			continue
-		}
-		totalCPU += cpuQuantity.Value()
-		isInitContainerGuaranteed := hasIntegralCPUs(pod, &container)
-		if !isInitContainerGuaranteed {
-			return false
+		if hasIntegralCPUs(&container) {
+			return true
 		}
 	}
 	for _, container := range pod.Spec.Containers {
-		var ok bool
-		if cpuQuantity, ok = container.Resources.Requests[corev1.ResourceCPU]; !ok {
-			continue
-		}
-		totalCPU += cpuQuantity.Value()
-		isAppContainerGuaranteed := hasIntegralCPUs(pod, &container)
-		if !isAppContainerGuaranteed {
-			return false
+		if hasIntegralCPUs(&container) {
+			return true
 		}
 	}
 
-	//No CPUs requested in all the containers in the pod
-	return totalCPU != 0
+	//No integralCPUs requested in all the containers of the pod
+	return false
 }
 
 // hasIntegralCPUs returns true if a container in pod is requesting integral CPUs else returns false
-func hasIntegralCPUs(pod *corev1.Pod, container *corev1.Container) bool {
-	cpuQuantity := container.Resources.Requests[corev1.ResourceCPU]
+func hasIntegralCPUs(container *corev1.Container) bool {
+	cpuQuantity, ok := container.Resources.Requests[corev1.ResourceCPU]
+	if !ok {
+		return false
+	}
 	return cpuQuantity.Value()*1000 == cpuQuantity.MilliValue()
 }
 
@@ -138,7 +149,7 @@ func (resMon *PodResourcesScanner) Scan() (ScanResponse, error) {
 		if err != nil {
 			klog.ErrorS(err, "failed to calculate fingerprint")
 		} else {
-			klog.InfoS("podFingerprint calculated", "status", status.Repr())
+			klog.V(1).InfoS("podFingerprint calculated", "status", status.Repr())
 
 			retVal.Attributes = append(retVal.Attributes, v1alpha2.AttributeInfo{
 				Name:  podfingerprint.Attribute,
@@ -149,11 +160,10 @@ func (resMon *PodResourcesScanner) Scan() (ScanResponse, error) {
 	var podResData []PodResources
 
 	for _, podResource := range respPodResources {
-		klog.InfoS("scanning pod", "podName", podResource.GetName())
-		hasDevice := hasDevice(podResource)
-		isWatchable, isIntegralGuaranteed, err := resMon.isWatchable(podResource.GetNamespace(), podResource.GetName(), hasDevice)
+		klog.V(1).InfoS("scanning pod", "podName", podResource.GetName())
+		isWatchable, isExclusiveCPUs, err := resMon.isWatchable(ctx, podResource)
 		if err != nil {
-			return ScanResponse{}, fmt.Errorf("checking if pod in a namespace is watchable, namespace:%v, pod name %v: %v", podResource.GetNamespace(), podResource.GetName(), err)
+			return ScanResponse{}, fmt.Errorf("checking if pod in a namespace is watchable, namespace:%v, pod name %v: %w", podResource.GetNamespace(), podResource.GetName(), err)
 		}
 		if !isWatchable {
 			continue
@@ -169,19 +179,17 @@ func (resMon *PodResourcesScanner) Scan() (ScanResponse, error) {
 				Name: container.Name,
 			}
 
-			if isIntegralGuaranteed {
-				cpuIDs := container.GetCpuIds()
-				if len(cpuIDs) > 0 {
-					var resCPUs []string
-					for _, cpuID := range container.GetCpuIds() {
-						resCPUs = append(resCPUs, strconv.FormatInt(cpuID, 10))
-					}
-					contRes.Resources = []ResourceInfo{
-						{
-							Name: corev1.ResourceCPU,
-							Data: resCPUs,
-						},
-					}
+			cpuIDs := container.GetCpuIds()
+			if len(cpuIDs) > 0 && isExclusiveCPUs {
+				var resCPUs []string
+				for _, cpuID := range cpuIDs {
+					resCPUs = append(resCPUs, strconv.FormatInt(cpuID, 10))
+				}
+				contRes.Resources = []ResourceInfo{
+					{
+						Name: corev1.ResourceCPU,
+						Data: resCPUs,
+					},
 				}
 			}
 
@@ -195,14 +203,14 @@ func (resMon *PodResourcesScanner) Scan() (ScanResponse, error) {
 			}
 
 			for _, block := range container.GetMemory() {
-				if block.GetSize_() == 0 {
+				if block.GetSize() == 0 {
 					continue
 				}
 
 				topology := getNumaNodeIds(block.GetTopology())
 				contRes.Resources = append(contRes.Resources, ResourceInfo{
 					Name:        corev1.ResourceName(block.MemoryType),
-					Data:        []string{fmt.Sprintf("%d", block.GetSize_())},
+					Data:        []string{fmt.Sprintf("%d", block.GetSize())},
 					NumaNodeIds: topology,
 				})
 			}
@@ -232,7 +240,7 @@ func hasDevice(podResource *podresourcesapi.PodResources) bool {
 			return true
 		}
 	}
-	klog.InfoS("pod doesn't have devices", "podName", podResource.GetName())
+	klog.V(1).InfoS("pod doesn't have devices", "podName", podResource.GetName())
 	return false
 }
 

@@ -17,33 +17,35 @@ limitations under the License.
 package nfdworker
 
 import (
-	"crypto/tls"
-	"crypto/x509"
+	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
 
-	"golang.org/x/net/context"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/credentials/insecure"
+	"maps"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/validation"
+	k8sclient "k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
 	klogutils "sigs.k8s.io/node-feature-discovery/pkg/utils/klog"
 	"sigs.k8s.io/yaml"
 
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"sigs.k8s.io/node-feature-discovery/pkg/apihelper"
-	nfdv1alpha1 "sigs.k8s.io/node-feature-discovery/pkg/apis/nfd/v1alpha1"
-	nfdclient "sigs.k8s.io/node-feature-discovery/pkg/generated/clientset/versioned"
-	pb "sigs.k8s.io/node-feature-discovery/pkg/labeler"
+	nfdclient "sigs.k8s.io/node-feature-discovery/api/generated/clientset/versioned"
+	nfdv1alpha1 "sigs.k8s.io/node-feature-discovery/api/nfd/v1alpha1"
 	"sigs.k8s.io/node-feature-discovery/pkg/utils"
 	"sigs.k8s.io/node-feature-discovery/pkg/version"
 	"sigs.k8s.io/node-feature-discovery/source"
@@ -78,10 +80,21 @@ type coreConfig struct {
 	Klog           klogutils.KlogConfigOpts
 	LabelWhiteList utils.RegexpVal
 	NoPublish      bool
+	NoOwnerRefs    bool
+	// OwnerRefs selects the Kubernetes objects used as owners of the
+	// NodeFeature published by this worker. An explicit empty value disables
+	// owner references.
+	OwnerRefs      *OwnerRefSources
 	FeatureSources []string
 	Sources        *[]string
 	LabelSources   []string
-	SleepInterval  utils.DurationVal
+	// NoPublishFeatures lists feature keys that are discovered (so they remain
+	// available to label sources and inline custom rules) but are omitted from
+	// the published NodeFeature object to reduce its size. Each entry is matched
+	// against the "<source>.<feature>" key, exactly or, when it ends with "*",
+	// as a prefix (e.g. "pci.device" or "pci.*").
+	NoPublishFeatures []string
+	SleepInterval     utils.DurationVal
 }
 
 type sourcesConfig map[string]source.Config
@@ -89,44 +102,124 @@ type sourcesConfig map[string]source.Config
 // Labels are a Kubernetes representation of discovered features.
 type Labels map[string]string
 
+const (
+	ownerRefNode = "node"
+	ownerRefPod  = "pod"
+	ownerRefDS   = "ds"
+)
+
+var ownerRefSourceOrder = []string{ownerRefNode, ownerRefPod, ownerRefDS}
+
+// OwnerRefSources is the ordered set of object types that should own the
+// NodeFeature published by nfd-worker. It implements flag.Value and JSON
+// unmarshalling so command-line and configuration-file input share the same
+// validation.
+type OwnerRefSources []string
+
+// Set implements flag.Value.
+func (s *OwnerRefSources) Set(value string) error {
+	values := []string{}
+	for value := range strings.SplitSeq(value, ",") {
+		if value = strings.TrimSpace(value); value != "" {
+			values = append(values, value)
+		}
+	}
+
+	normalized, err := normalizeOwnerRefSources(values)
+	if err != nil {
+		return err
+	}
+	*s = normalized
+	return nil
+}
+
+// String implements flag.Value.
+func (s *OwnerRefSources) String() string {
+	if s == nil {
+		return ""
+	}
+	return strings.Join(*s, ",")
+}
+
+// UnmarshalJSON validates owner reference sources read from YAML/JSON worker
+// configuration.
+func (s *OwnerRefSources) UnmarshalJSON(data []byte) error {
+	var values []string
+	if err := json.Unmarshal(data, &values); err != nil {
+		return err
+	}
+
+	normalized, err := normalizeOwnerRefSources(values)
+	if err != nil {
+		return err
+	}
+	*s = normalized
+	return nil
+}
+
+func normalizeOwnerRefSources(values []string) (OwnerRefSources, error) {
+	selected := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		if _, found := selected[value]; found {
+			return nil, fmt.Errorf("duplicate owner reference source %q", value)
+		}
+		switch value {
+		case ownerRefNode, ownerRefPod, ownerRefDS:
+			selected[value] = struct{}{}
+		default:
+			return nil, fmt.Errorf("invalid owner reference source %q (must be one of: node, pod, ds)", value)
+		}
+	}
+
+	normalized := make(OwnerRefSources, 0, len(selected))
+	for _, value := range ownerRefSourceOrder {
+		if _, found := selected[value]; found {
+			normalized = append(normalized, value)
+		}
+	}
+	return normalized, nil
+}
+
 // Args are the command line arguments of NfdWorker.
 type Args struct {
-	CaFile               string
-	CertFile             string
-	ConfigFile           string
-	EnableNodeFeatureApi bool
-	KeyFile              string
-	Klog                 map[string]*utils.KlogFlagVal
-	Kubeconfig           string
-	Oneshot              bool
-	Options              string
-	Server               string
-	ServerNameOverride   string
-	MetricsPort          int
+	ConfigFile  string
+	Klog        map[string]*utils.KlogFlagVal
+	Kubeconfig  string
+	Oneshot     bool
+	Options     string
+	Port        int
+	NoOwnerRefs bool
 
 	Overrides ConfigOverrideArgs
 }
 
 // ConfigOverrideArgs are args that override config file options
 type ConfigOverrideArgs struct {
-	NoPublish *bool
-
-	FeatureSources *utils.StringSliceVal
-	LabelSources   *utils.StringSliceVal
+	NoPublish         *bool
+	NoOwnerRefs       *bool
+	OwnerRefs         *OwnerRefSources
+	FeatureSources    *utils.StringSliceVal
+	LabelSources      *utils.StringSliceVal
+	NoPublishFeatures *utils.StringSliceVal
 }
 
 type nfdWorker struct {
 	args                Args
-	certWatch           *utils.FsWatcher
-	clientConn          *grpc.ClientConn
 	configFilePath      string
 	config              *NFDConfig
 	kubernetesNamespace string
-	grpcClient          pb.LabelerClient
-	nfdClient           *nfdclient.Clientset
-	stop                chan struct{} // channel for signaling stop
+	k8sClient           k8sclient.Interface
+	nfdClient           nfdclient.Interface
+	stop                chan struct{}              // channel for signaling stop
+	sourceEvent         chan *source.FeatureSource // channel for events from sources
 	featureSources      []source.FeatureSource
 	labelSources        []source.LabelSource
+	ownerReference      []metav1.OwnerReference
+
+	// noPublishNoMatchWarned records core.noPublishFeatures patterns already
+	// warned about for matching no feature, so a persistent no-match (typically
+	// a typo) is logged once rather than on every discovery cycle.
+	noPublishNoMatchWarned sets.Set[string]
 }
 
 // This ticker can represent infinite and normal intervals.
@@ -134,45 +227,86 @@ type infiniteTicker struct {
 	*time.Ticker
 }
 
+// NfdWorkerOption sets properties of the NfdWorker instance.
+type NfdWorkerOption interface {
+	apply(*nfdWorker)
+}
+
+// WithArgs is used for passing settings from command line arguments.
+func WithArgs(args *Args) NfdWorkerOption {
+	return &nfdWorkerOpt{f: func(n *nfdWorker) { n.args = *args }}
+}
+
+// WithKuberneteClient forces to use the given kubernetes client, without
+// initializing one from kubeconfig.
+func WithKubernetesClient(cli k8sclient.Interface) NfdWorkerOption {
+	return &nfdWorkerOpt{f: func(n *nfdWorker) { n.k8sClient = cli }}
+}
+
+// WithNFDClient forces to use the given client for the NFD API, without
+// initializing one from kubeconfig.
+func WithNFDClient(cli nfdclient.Interface) NfdWorkerOption {
+	return &nfdWorkerOpt{f: func(n *nfdWorker) { n.nfdClient = cli }}
+}
+
+type nfdWorkerOpt struct {
+	f func(*nfdWorker)
+}
+
+func (f *nfdWorkerOpt) apply(n *nfdWorker) {
+	f.f(n)
+}
+
 // NewNfdWorker creates new NfdWorker instance.
-func NewNfdWorker(args *Args) (NfdWorker, error) {
+func NewNfdWorker(opts ...NfdWorkerOption) (NfdWorker, error) {
 	nfd := &nfdWorker{
-		args:                *args,
-		config:              &NFDConfig{},
-		kubernetesNamespace: utils.GetKubernetesNamespace(),
-		stop:                make(chan struct{}, 1),
+		config:                 &NFDConfig{},
+		kubernetesNamespace:    utils.GetKubernetesNamespace(),
+		stop:                   make(chan struct{}),
+		sourceEvent:            make(chan *source.FeatureSource),
+		noPublishNoMatchWarned: sets.New[string](),
 	}
 
-	// Check TLS related args
-	if args.CertFile != "" || args.KeyFile != "" || args.CaFile != "" {
-		if args.CertFile == "" {
-			return nfd, fmt.Errorf("-cert-file needs to be specified alongside -key-file and -ca-file")
-		}
-		if args.KeyFile == "" {
-			return nfd, fmt.Errorf("-key-file needs to be specified alongside -cert-file and -ca-file")
-		}
-		if args.CaFile == "" {
-			return nfd, fmt.Errorf("-ca-file needs to be specified alongside -cert-file and -key-file")
-		}
+	for _, o := range opts {
+		o.apply(nfd)
 	}
 
-	if args.ConfigFile != "" {
-		nfd.configFilePath = filepath.Clean(args.ConfigFile)
+	if nfd.args.ConfigFile != "" {
+		nfd.configFilePath = filepath.Clean(nfd.args.ConfigFile)
+	}
+
+	// k8sClient might've been set via opts by tests
+	if nfd.k8sClient == nil {
+		kubeconfig, err := utils.GetKubeconfig(nfd.args.Kubeconfig)
+		if err != nil {
+			return nfd, err
+		}
+		cli, err := k8sclient.NewForConfig(kubeconfig)
+		if err != nil {
+			return nfd, err
+		}
+		nfd.k8sClient = cli
 	}
 
 	return nfd, nil
 }
 
 func newDefaultConfig() *NFDConfig {
+	ownerRefs := OwnerRefSources{ownerRefPod, ownerRefDS}
 	return &NFDConfig{
 		Core: coreConfig{
 			LabelWhiteList: utils.RegexpVal{Regexp: *regexp.MustCompile("")},
 			SleepInterval:  utils.DurationVal{Duration: 60 * time.Second},
+			OwnerRefs:      &ownerRefs,
 			FeatureSources: []string{"all"},
 			LabelSources:   []string{"all"},
 			Klog:           make(map[string]string),
 		},
 	}
+}
+
+func (w *nfdWorker) Healthz(writer http.ResponseWriter, _ *http.Request) {
+	writer.WriteHeader(http.StatusOK)
 }
 
 func (i *infiniteTicker) Reset(d time.Duration) {
@@ -182,8 +316,21 @@ func (i *infiniteTicker) Reset(d time.Duration) {
 	default:
 		// If the sleep interval is not a positive number the ticker will act
 		// as if it was set to an infinite duration by not ticking.
-		i.Ticker.Stop()
+		i.Stop()
 	}
+}
+
+// Publish labels.
+func (w *nfdWorker) publishNodeFeatureObject() error {
+	// Get the set of feature labels.
+	labels := createFeatureLabels(w.labelSources, w.config.Core.LabelWhiteList.Regexp)
+
+	// Update the node with the feature labels.
+	if !w.config.Core.NoPublish {
+		return w.advertiseFeatures(labels)
+	}
+
+	return nil
 }
 
 // Run feature discovery.
@@ -203,50 +350,156 @@ func (w *nfdWorker) runFeatureDiscovery() error {
 	if w.config.Core.SleepInterval.Duration > 0 && discoveryDuration > w.config.Core.SleepInterval.Duration/2 {
 		klog.InfoS("feature discovery sources took over half of sleep interval ", "duration", discoveryDuration, "sleepInterval", w.config.Core.SleepInterval.Duration)
 	}
-	// Get the set of feature labels.
-	labels := createFeatureLabels(w.labelSources, w.config.Core.LabelWhiteList.Regexp)
 
-	// Update the node with the feature labels.
-	if !w.config.Core.NoPublish {
-		return w.advertiseFeatures(labels)
+	return w.publishNodeFeatureObject()
+}
+
+// setOwnerReference resolves the owner references to publish on the worker's
+// NodeFeature. The complete ownerReferences list is replaced with the resolved
+// value so deselected owners cannot continue extending the object's lifetime.
+func (w *nfdWorker) setOwnerReference() error {
+	if w.config.Core.NoOwnerRefs {
+		w.ownerReference = []metav1.OwnerReference{}
+		return nil
 	}
 
+	sources := OwnerRefSources{ownerRefPod, ownerRefDS}
+	if w.config.Core.OwnerRefs != nil {
+		sources = *w.config.Core.OwnerRefs
+	}
+	ownerRefs, err := w.resolveOwnerReferences(sources)
+	if err != nil {
+		return err
+	}
+	w.ownerReference = ownerRefs
 	return nil
 }
 
-// Run NfdWorker client. Returns if a fatal error is encountered, or, after
+func (w *nfdWorker) resolveOwnerReferences(sources OwnerRefSources) ([]metav1.OwnerReference, error) {
+	ownerRefs := make([]metav1.OwnerReference, 0, len(sources))
+	for _, source := range sources {
+		ownerRef, err := w.resolveOwnerReference(source)
+		if err != nil {
+			return nil, err
+		}
+		if ownerRef != nil {
+			ownerRefs = append(ownerRefs, *ownerRef)
+		}
+	}
+	return ownerRefs, nil
+}
+
+func (w *nfdWorker) resolveOwnerReference(source string) (*metav1.OwnerReference, error) {
+	switch source {
+	case ownerRefNode:
+		return w.resolveNodeOwnerReference()
+	case ownerRefPod:
+		return resolvePodOwnerReference(), nil
+	case ownerRefDS:
+		return w.resolveDaemonSetOwnerReference()
+	default:
+		// OwnerRefSources validates input, but fail safely if a value is
+		// constructed directly by a caller.
+		return nil, fmt.Errorf("invalid owner reference source %q", source)
+	}
+}
+
+func (w *nfdWorker) resolveNodeOwnerReference() (*metav1.OwnerReference, error) {
+	nodeName := utils.NodeName()
+	if nodeName == "" {
+		return nil, fmt.Errorf("cannot resolve Node owner reference: NODE_NAME not specified")
+	}
+	node, err := w.k8sClient.CoreV1().Nodes().Get(context.TODO(), nodeName, metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("cannot resolve Node owner reference %q: %w", nodeName, err)
+	}
+	return &metav1.OwnerReference{
+		APIVersion:         "v1",
+		Kind:               "Node",
+		Name:               node.Name,
+		UID:                node.UID,
+		BlockOwnerDeletion: new(false),
+	}, nil
+}
+
+func resolvePodOwnerReference() *metav1.OwnerReference {
+	podName, podUID := os.Getenv("POD_NAME"), os.Getenv("POD_UID")
+	if podName == "" || podUID == "" {
+		klog.InfoS("Cannot resolve Pod owner reference, POD_NAME and POD_UID must be specified")
+		return nil
+	}
+	return &metav1.OwnerReference{
+		APIVersion:         "v1",
+		Kind:               "Pod",
+		Name:               podName,
+		UID:                types.UID(podUID),
+		BlockOwnerDeletion: new(false),
+	}
+}
+
+func (w *nfdWorker) resolveDaemonSetOwnerReference() (*metav1.OwnerReference, error) {
+	podName := os.Getenv("POD_NAME")
+	if podName == "" {
+		klog.InfoS("Cannot resolve DaemonSet owner reference, POD_NAME not specified")
+		return nil, nil
+	}
+	pod, err := w.k8sClient.CoreV1().Pods(w.kubernetesNamespace).Get(context.TODO(), podName, metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("cannot get worker Pod %q to resolve DaemonSet owner reference: %w", podName, err)
+	}
+	daemonSetOwner, err := findDaemonSetOwnerReference(pod.OwnerReferences)
+	if err != nil {
+		return nil, fmt.Errorf("cannot resolve DaemonSet owner reference: worker Pod %q %w", podName, err)
+	}
+	if daemonSetOwner == nil {
+		klog.InfoS("Cannot resolve DaemonSet owner reference, worker Pod is not owned by a DaemonSet", "pod", podName)
+		return nil, nil
+	}
+	daemonSetOwner.BlockOwnerDeletion = new(false)
+	return daemonSetOwner, nil
+}
+
+func findDaemonSetOwnerReference(ownerRefs []metav1.OwnerReference) (*metav1.OwnerReference, error) {
+	var daemonSetOwner *metav1.OwnerReference
+	for i := range ownerRefs {
+		owner := ownerRefs[i]
+		if owner.APIVersion != "apps/v1" || owner.Kind != "DaemonSet" {
+			continue
+		}
+		if daemonSetOwner != nil {
+			return nil, fmt.Errorf("has multiple DaemonSet owners")
+		}
+		daemonSetOwner = &owner
+	}
+	return daemonSetOwner, nil
+}
+
+// Run NfdWorker client. Returns an error if a fatal error is encountered, or, after
 // one request if OneShot is set to 'true' in the worker args.
 func (w *nfdWorker) Run() error {
 	klog.InfoS("Node Feature Discovery Worker", "version", version.Get(), "nodeName", utils.NodeName(), "namespace", w.kubernetesNamespace)
 
-	// Create watcher for config file and read initial configuration
-	configWatch, err := utils.CreateFsWatcher(time.Second, w.configFilePath)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Read configuration file
+	err := w.configure(ctx, w.configFilePath, w.args.Options)
 	if err != nil {
 		return err
 	}
-	if err := w.configure(w.configFilePath, w.args.Options); err != nil {
-		return err
-	}
-
-	// Create watcher for TLS certificates
-	w.certWatch, err = utils.CreateFsWatcher(time.Second, w.args.CaFile, w.args.CertFile, w.args.KeyFile)
-	if err != nil {
-		return err
-	}
-
-	defer w.grpcDisconnect()
 
 	// Create ticker for feature discovery and run feature discovery once before the loop.
 	labelTrigger := infiniteTicker{Ticker: time.NewTicker(1)}
 	labelTrigger.Reset(w.config.Core.SleepInterval.Duration)
 	defer labelTrigger.Stop()
 
+	httpMux := http.NewServeMux()
+
 	// Register to metrics server
-	if w.args.MetricsPort > 0 {
-		go runMetricsServer(w.args.MetricsPort)
-		registerVersion(version.Get())
-		defer stopMetricsServer()
-	}
+	promRegistry := prometheus.NewRegistry()
+	promRegistry.MustRegister(buildInfo, featureDiscoveryDuration)
+	httpMux.Handle("/metrics", promhttp.HandlerFor(promRegistry, promhttp.HandlerOpts{}))
+	registerVersion(version.Get())
 
 	err = w.runFeatureDiscovery()
 	if err != nil {
@@ -258,6 +511,17 @@ func (w *nfdWorker) Run() error {
 		return nil
 	}
 
+	// Register health endpoint (at this point we're "ready and live")
+	httpMux.HandleFunc("/healthz", w.Healthz)
+
+	// Start HTTP server
+	httpServer := http.Server{Addr: fmt.Sprintf(":%d", w.args.Port), Handler: httpMux}
+	go func() {
+		klog.InfoS("http server starting", "port", httpServer.Addr)
+		klog.InfoS("http server stopped", "exitCode", httpServer.ListenAndServe())
+	}()
+	defer httpServer.Close() // nolint: errcheck
+
 	for {
 		select {
 		case <-labelTrigger.C:
@@ -266,32 +530,17 @@ func (w *nfdWorker) Run() error {
 				return err
 			}
 
-		case <-configWatch.Events:
-			klog.InfoS("reloading configuration")
-			if err := w.configure(w.configFilePath, w.args.Options); err != nil {
+		case s := <-w.sourceEvent:
+			if err := (*s).Discover(); err != nil {
+				klog.ErrorS(err, "feature discovery failed", "source", (*s).Name())
+				break
+			}
+			if err = w.publishNodeFeatureObject(); err != nil {
 				return err
 			}
-			// Manage connection to master
-			if w.config.Core.NoPublish || !w.args.EnableNodeFeatureApi {
-				w.grpcDisconnect()
-			}
-
-			// Always re-label after a re-config event. This way the new config
-			// comes into effect even if the sleep interval is long (or infinite)
-			labelTrigger.Reset(w.config.Core.SleepInterval.Duration)
-			err = w.runFeatureDiscovery()
-			if err != nil {
-				return err
-			}
-
-		case <-w.certWatch.Events:
-			klog.InfoS("TLS certificate update, renewing connection to nfd-master")
-			w.grpcDisconnect()
 
 		case <-w.stop:
 			klog.InfoS("shutting down nfd-worker")
-			configWatch.Close()
-			w.certWatch.Close()
 			return nil
 		}
 	}
@@ -299,84 +548,18 @@ func (w *nfdWorker) Run() error {
 
 // Stop NfdWorker
 func (w *nfdWorker) Stop() {
-	select {
-	case w.stop <- struct{}{}:
-	default:
-	}
+	close(w.stop)
 }
 
-// getGrpcClient returns client connection to the NFD gRPC server. It creates a
-// connection if one hasn't yet been established,.
-func (w *nfdWorker) getGrpcClient() (pb.LabelerClient, error) {
-	if w.grpcClient != nil {
-		return w.grpcClient, nil
-	}
-
-	// Check that if a connection already exists
-	if w.clientConn != nil {
-		return nil, fmt.Errorf("client connection already exists")
-	}
-
-	// Dial and create a client
-	dialCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-	dialOpts := []grpc.DialOption{grpc.WithBlock()}
-	if w.args.CaFile != "" || w.args.CertFile != "" || w.args.KeyFile != "" {
-		// Load client cert for client authentication
-		cert, err := tls.LoadX509KeyPair(w.args.CertFile, w.args.KeyFile)
-		if err != nil {
-			return nil, fmt.Errorf("failed to load client certificate: %v", err)
-		}
-		// Load CA cert for server cert verification
-		caCert, err := os.ReadFile(w.args.CaFile)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read root certificate file: %v", err)
-		}
-		caPool := x509.NewCertPool()
-		if ok := caPool.AppendCertsFromPEM(caCert); !ok {
-			return nil, fmt.Errorf("failed to add certificate from '%s'", w.args.CaFile)
-		}
-		// Create TLS config
-		tlsConfig := &tls.Config{
-			Certificates: []tls.Certificate{cert},
-			RootCAs:      caPool,
-			ServerName:   w.args.ServerNameOverride,
-			MinVersion:   tls.VersionTLS13,
-		}
-		dialOpts = append(dialOpts, grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)))
-	} else {
-		dialOpts = append(dialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	}
-	klog.InfoS("connecting to nfd-master", "address", w.args.Server)
-	conn, err := grpc.DialContext(dialCtx, w.args.Server, dialOpts...)
-	if err != nil {
-		return nil, err
-	}
-	w.clientConn = conn
-
-	w.grpcClient = pb.NewLabelerClient(w.clientConn)
-
-	return w.grpcClient, nil
-}
-
-// grpcDisconnect closes the gRPC connection to NFD master
-func (w *nfdWorker) grpcDisconnect() {
-	if w.clientConn != nil {
-		klog.InfoS("closing connection to nfd-master")
-		w.clientConn.Close()
-	}
-	w.clientConn = nil
-	w.grpcClient = nil
-}
 func (c *coreConfig) sanitize() {
 	if c.SleepInterval.Duration > 0 && c.SleepInterval.Duration < time.Second {
 		klog.InfoS("too short sleep interval specified, forcing to 1s",
-			"sleepInterval", c.SleepInterval.Duration.String())
+			"sleepInterval", c.SleepInterval.String())
 		c.SleepInterval = utils.DurationVal{Duration: time.Second}
 	}
 }
 
-func (w *nfdWorker) configureCore(c coreConfig) error {
+func (w *nfdWorker) configureCore(ctx context.Context, c coreConfig) error {
 	// Handle klog
 	err := klogutils.MergeKlogConfiguration(w.args.Klog, c.Klog)
 	if err != nil {
@@ -411,10 +594,7 @@ func (w *nfdWorker) configureCore(c coreConfig) error {
 		}
 	}
 
-	w.featureSources = make([]source.FeatureSource, 0, len(featureSources))
-	for _, s := range featureSources {
-		w.featureSources = append(w.featureSources, s)
-	}
+	w.featureSources = slices.Collect(maps.Values(featureSources))
 
 	sort.Slice(w.featureSources, func(i, j int) bool { return w.featureSources[i].Name() < w.featureSources[j].Name() })
 
@@ -446,10 +626,7 @@ func (w *nfdWorker) configureCore(c coreConfig) error {
 		}
 	}
 
-	w.labelSources = make([]source.LabelSource, 0, len(labelSources))
-	for _, s := range labelSources {
-		w.labelSources = append(w.labelSources, s)
-	}
+	w.labelSources = slices.Collect(maps.Values(labelSources))
 
 	sort.Slice(w.labelSources, func(i, j int) bool {
 		iP, jP := w.labelSources[i].Priority(), w.labelSources[j].Priority()
@@ -458,6 +635,15 @@ func (w *nfdWorker) configureCore(c coreConfig) error {
 		}
 		return w.labelSources[i].Name() < w.labelSources[j].Name()
 	})
+
+	eventSources := source.GetAllEventSources()
+	for _, s := range eventSources {
+		if ok := featureSources[s.Name()]; ok != nil {
+			if err := s.SetNotifyChannel(ctx, w.sourceEvent); err != nil {
+				klog.ErrorS(err, "failed to set notify channel for event source", "source", s.Name())
+			}
+		}
+	}
 
 	if klogV := klog.V(1); klogV.Enabled() {
 		n := make([]string, len(w.featureSources))
@@ -473,11 +659,16 @@ func (w *nfdWorker) configureCore(c coreConfig) error {
 		klogV.InfoS("enabled label sources", "labelSources", n)
 	}
 
+	err = w.setOwnerReference()
+	if err != nil {
+		return err
+	}
+
 	return nil
 }
 
 // Parse configuration options
-func (w *nfdWorker) configure(filepath string, overrides string) error {
+func (w *nfdWorker) configure(ctx context.Context, filepath string, overrides string) error {
 	// Create a new default config
 	c := newDefaultConfig()
 	confSources := source.GetAllConfigurableSources()
@@ -487,27 +678,8 @@ func (w *nfdWorker) configure(filepath string, overrides string) error {
 	}
 
 	// Try to read and parse config file
-	if filepath != "" {
-		data, err := os.ReadFile(filepath)
-		if err != nil {
-			if os.IsNotExist(err) {
-				klog.InfoS("config file not found, using defaults", "path", filepath)
-			} else {
-				return fmt.Errorf("error reading config file: %s", err)
-			}
-		} else {
-			err = yaml.Unmarshal(data, c)
-			if err != nil {
-				return fmt.Errorf("failed to parse config file: %s", err)
-			}
-
-			if c.Core.Sources != nil {
-				klog.InfoS("usage of deprecated 'core.sources' config file option, please use 'core.labelSources' instead")
-				c.Core.LabelSources = *c.Core.Sources
-			}
-
-			klog.InfoS("configuration file parsed", "path", filepath)
-		}
+	if err := loadConfigFile(c, filepath); err != nil {
+		return err
 	}
 
 	// Parse config overrides
@@ -515,21 +687,16 @@ func (w *nfdWorker) configure(filepath string, overrides string) error {
 		return fmt.Errorf("failed to parse -options: %s", err)
 	}
 
-	if w.args.Overrides.NoPublish != nil {
-		c.Core.NoPublish = *w.args.Overrides.NoPublish
-	}
-	if w.args.Overrides.FeatureSources != nil {
-		c.Core.FeatureSources = *w.args.Overrides.FeatureSources
-	}
-	if w.args.Overrides.LabelSources != nil {
-		c.Core.LabelSources = *w.args.Overrides.LabelSources
+	w.applyConfigOverrides(c)
+	if c.Core.NoOwnerRefs || w.args.Overrides.NoOwnerRefs != nil {
+		klog.InfoS("usage of deprecated 'core.noOwnerRefs' configuration option or '-no-owner-refs' flag, please use 'core.ownerRefs: []' or '-owner-refs=' instead")
 	}
 
 	c.Core.sanitize()
 
 	w.config = c
 
-	if err := w.configureCore(c.Core); err != nil {
+	if err := w.configureCore(ctx, c.Core); err != nil {
 		return err
 	}
 
@@ -542,6 +709,59 @@ func (w *nfdWorker) configure(filepath string, overrides string) error {
 	return nil
 }
 
+// loadConfigFile reads the config file at filepath and unmarshals it into c. A
+// missing file is not an error: the defaults already in c are kept. An empty
+// filepath is a no-op.
+func loadConfigFile(c *NFDConfig, filepath string) error {
+	if filepath == "" {
+		return nil
+	}
+
+	data, err := os.ReadFile(filepath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			klog.InfoS("config file not found, using defaults", "path", filepath)
+			return nil
+		}
+		return fmt.Errorf("error reading config file: %s", err)
+	}
+
+	if err := yaml.Unmarshal(data, c); err != nil {
+		return fmt.Errorf("failed to parse config file: %s", err)
+	}
+
+	if c.Core.Sources != nil {
+		klog.InfoS("usage of deprecated 'core.sources' config file option, please use 'core.labelSources' instead")
+		c.Core.LabelSources = *c.Core.Sources
+	}
+
+	klog.InfoS("configuration file parsed", "path", filepath)
+	return nil
+}
+
+// applyConfigOverrides applies the command-line overrides onto the core config.
+func (w *nfdWorker) applyConfigOverrides(c *NFDConfig) {
+	if w.args.Overrides.NoPublish != nil {
+		c.Core.NoPublish = *w.args.Overrides.NoPublish
+	}
+	if w.args.Overrides.NoOwnerRefs != nil {
+		c.Core.NoOwnerRefs = *w.args.Overrides.NoOwnerRefs
+	}
+	if w.args.Overrides.OwnerRefs != nil {
+		ownerRefs := append(OwnerRefSources{}, (*w.args.Overrides.OwnerRefs)...)
+		c.Core.OwnerRefs = &ownerRefs
+	}
+	if w.args.Overrides.FeatureSources != nil {
+		c.Core.FeatureSources = *w.args.Overrides.FeatureSources
+	}
+	if w.args.Overrides.LabelSources != nil {
+		c.Core.LabelSources = *w.args.Overrides.LabelSources
+	}
+	if w.args.Overrides.NoPublishFeatures != nil {
+		c.Core.NoPublishFeatures = *w.args.Overrides.NoPublishFeatures
+	}
+}
+
 // createFeatureLabels returns the set of feature labels from the enabled
 // sources and the whitelist argument.
 func createFeatureLabels(sources []source.LabelSource, labelWhiteList regexp.Regexp) (labels Labels) {
@@ -550,15 +770,13 @@ func createFeatureLabels(sources []source.LabelSource, labelWhiteList regexp.Reg
 	// Get labels from all enabled label sources
 	klog.InfoS("starting feature discovery...")
 	for _, source := range sources {
-		labelsFromSource, err := getFeatureLabels(source, labelWhiteList)
+		labelsFromSource, err := GetFeatureLabels(source, labelWhiteList)
 		if err != nil {
 			klog.ErrorS(err, "discovery failed", "source", source.Name())
 			continue
 		}
 
-		for name, value := range labelsFromSource {
-			labels[name] = value
-		}
+		maps.Copy(labels, labelsFromSource)
 	}
 	if klogV := klog.V(1); klogV.Enabled() {
 		klogV.InfoS("feature discovery completed", "labels", utils.DelayedDumper(labels))
@@ -570,41 +788,36 @@ func createFeatureLabels(sources []source.LabelSource, labelWhiteList regexp.Reg
 
 // getFeatureLabels returns node labels for features discovered by the
 // supplied source.
-func getFeatureLabels(source source.LabelSource, labelWhiteList regexp.Regexp) (labels Labels, err error) {
+func GetFeatureLabels(source source.LabelSource, labelWhiteList regexp.Regexp) (labels Labels, err error) {
 	labels = Labels{}
 	features, err := source.GetLabels()
 	if err != nil {
 		return nil, err
 	}
 
-	// Prefix for labels in the default namespace
-	prefix := source.Name() + "-"
-	switch source.Name() {
-	case "local", "custom":
-		// Do not prefix labels from the custom rules, hooks or feature files
-		prefix = ""
-	}
-
 	for k, v := range features {
-		// Split label name into namespace and name compoents. Use dummy 'ns'
-		// default namespace because there is no function to validate just
-		// the name part
-		split := strings.SplitN(k, "/", 2)
+		name := k
+		switch sourceName := source.Name(); sourceName {
+		case "local", "custom":
+			// No mangling of labels from the custom rules or feature files
+		default:
+			// Prefix for labels from other sources
+			if !strings.Contains(name, "/") {
+				name = nfdv1alpha1.FeatureLabelNs + "/" + sourceName + "-" + name
+			}
+		}
+		// Split label name into namespace and name compoents
+		split := strings.SplitN(name, "/", 2)
 
-		label := prefix + split[0]
-		nameForValidation := "ns/" + label
-		nameForWhiteListing := label
-
+		nameForWhiteListing := name
 		if len(split) == 2 {
-			label = k
-			nameForValidation = label
 			nameForWhiteListing = split[1]
 		}
 
 		// Validate label name.
-		errs := validation.IsQualifiedName(nameForValidation)
+		errs := validation.IsQualifiedName(name)
 		if len(errs) > 0 {
-			klog.InfoS("ignoring label with invalid name", "lableKey", label, "errors", errs)
+			klog.InfoS("ignoring label with invalid name", "labelKey", name, "errors", errs)
 			continue
 		}
 
@@ -612,7 +825,7 @@ func getFeatureLabels(source source.LabelSource, labelWhiteList regexp.Regexp) (
 		// Validate label value
 		errs = validation.IsValidLabelValue(value)
 		if len(errs) > 0 {
-			klog.InfoS("ignoring label with invalide value", "labelKey", label, "labelValue", value, "errors", errs)
+			klog.InfoS("ignoring label with invalid value", "labelKey", name, "labelValue", value, "errors", errs)
 			continue
 		}
 
@@ -622,52 +835,78 @@ func getFeatureLabels(source source.LabelSource, labelWhiteList regexp.Regexp) (
 			continue
 		}
 
-		labels[label] = value
+		labels[name] = value
 	}
 	return labels, nil
 }
 
 // advertiseFeatures advertises the features of a Kubernetes node
 func (w *nfdWorker) advertiseFeatures(labels Labels) error {
-	if w.args.EnableNodeFeatureApi {
-		// Create/update NodeFeature CR object
-		if err := w.updateNodeFeatureObject(labels); err != nil {
-			return fmt.Errorf("failed to advertise features (via CRD API): %w", err)
-		}
-	} else {
-		// Create/update feature labels through gRPC connection to nfd-master
-		if err := w.advertiseFeatureLabels(labels); err != nil {
-			return fmt.Errorf("failed to advertise features (via gRPC): %w", err)
-		}
+	// Create/update NodeFeature CR object
+	if err := w.updateNodeFeatureObject(labels); err != nil {
+		return fmt.Errorf("failed to advertise features (via CRD API): %w", err)
 	}
+
 	return nil
 }
 
-// advertiseFeatureLabels advertises the feature labels to a Kubernetes node
-// via the NFD server.
-func (w *nfdWorker) advertiseFeatureLabels(labels Labels) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	klog.InfoS("sending labeling request to nfd-master")
-
-	labelReq := pb.SetLabelsRequest{Labels: labels,
-		Features:   source.GetAllFeatures(),
-		NfdVersion: version.Get(),
-		NodeName:   utils.NodeName()}
-
-	cli, err := w.getGrpcClient()
-	if err != nil {
-		return err
+// removeNoPublishFeatures deletes the feature keys matched by patterns from the
+// Features that will be published in the NodeFeature object. Discovery is not
+// affected, so the features remain available to label sources and inline custom
+// rules; they are only omitted from the published object. Each pattern matches
+// the "<source>.<feature>" key exactly, or as a prefix when it ends with "*"
+// (e.g. "pci.device" or "pci.*").
+//
+// It returns the patterns that matched no feature key. That usually means a
+// typo, but it can be legitimate on a heterogeneous cluster where the same
+// config reaches nodes lacking the targeted hardware, so the caller logs it
+// informationally rather than treating it as an error.
+func removeNoPublishFeatures(features *nfdv1alpha1.Features, patterns []string) []string {
+	if features == nil || len(patterns) == 0 {
+		return nil
+	}
+	matched := make([]bool, len(patterns))
+	matches := func(key string) bool {
+		hit := false
+		for i, p := range patterns {
+			if patternMatches(key, p) {
+				matched[i] = true
+				hit = true
+			}
+		}
+		return hit
 	}
 
-	_, err = cli.SetLabels(ctx, &labelReq)
-	if err != nil {
-		klog.ErrorS(err, "failed to label node")
-		return err
-	}
+	deleteMatchingKeys(features.Flags, matches)
+	deleteMatchingKeys(features.Attributes, matches)
+	deleteMatchingKeys(features.Instances, matches)
 
-	return nil
+	var unmatched []string
+	for i, p := range patterns {
+		if !matched[i] {
+			unmatched = append(unmatched, p)
+		}
+	}
+	return unmatched
+}
+
+// patternMatches reports whether a feature key matches a single no-publish
+// pattern. A pattern ending in "*" matches by prefix; otherwise it must equal
+// the key exactly.
+func patternMatches(key, pattern string) bool {
+	if prefix, ok := strings.CutSuffix(pattern, "*"); ok {
+		return strings.HasPrefix(key, prefix)
+	}
+	return key == pattern
+}
+
+// deleteMatchingKeys removes every entry of m whose key satisfies matches.
+func deleteMatchingKeys[V any](m map[string]V, matches func(string) bool) {
+	for k := range m {
+		if matches(k) {
+			delete(m, k)
+		}
+	}
 }
 
 // updateNodeFeatureObject creates/updates the node-specific NodeFeature custom resource.
@@ -680,22 +919,41 @@ func (m *nfdWorker) updateNodeFeatureObject(labels Labels) error {
 	namespace := m.kubernetesNamespace
 
 	features := source.GetAllFeatures()
+	annotations := map[string]string{nfdv1alpha1.WorkerVersionAnnotation: version.Get()}
+	if podUID := os.Getenv("POD_UID"); podUID != "" {
+		// This is deliberately written with the discovered spec. A new value
+		// tells nfd-master that a newly started worker completed discovery even
+		// when the resulting spec is identical to the previous one.
+		annotations[nfdv1alpha1.WorkerPodUIDAnnotation] = podUID
+	}
+
+	// Strip features that are configured not to be published. Discovery has
+	// already run (and feature labels have already been computed from the full
+	// set), so this only shrinks the published object, reducing load on the
+	// apiserver, etcd and nfd-master's informer cache.
+	for _, p := range removeNoPublishFeatures(features, m.config.Core.NoPublishFeatures) {
+		if !m.noPublishNoMatchWarned.Has(p) {
+			m.noPublishNoMatchWarned.Insert(p)
+			klog.InfoS("core.noPublishFeatures pattern matched no feature; possible typo, or the targeted hardware is absent on this node", "pattern", p)
+		}
+	}
 
 	// TODO: we could implement some simple caching of the object, only get it
 	// every 10 minutes or so because nobody else should really be modifying it
 	if nfr, err := cli.NfdV1alpha1().NodeFeatures(namespace).Get(context.TODO(), nodename, metav1.GetOptions{}); errors.IsNotFound(err) {
-		klog.InfoS("creating NodeFeature object", "nodefeature", klog.KObj(nfr))
 		nfr = &nfdv1alpha1.NodeFeature{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:        nodename,
-				Annotations: map[string]string{nfdv1alpha1.WorkerVersionAnnotation: version.Get()},
-				Labels:      map[string]string{nfdv1alpha1.NodeFeatureObjNodeNameLabel: nodename},
+				Name:            nodename,
+				Annotations:     annotations,
+				Labels:          map[string]string{nfdv1alpha1.NodeFeatureObjNodeNameLabel: nodename},
+				OwnerReferences: m.ownerReference,
 			},
 			Spec: nfdv1alpha1.NodeFeatureSpec{
 				Features: *features,
 				Labels:   labels,
 			},
 		}
+		klog.InfoS("creating NodeFeature object", "nodefeature", klog.KObj(nfr))
 
 		nfrCreated, err := cli.NfdV1alpha1().NodeFeatures(namespace).Create(context.TODO(), nfr, metav1.CreateOptions{})
 		if err != nil {
@@ -707,8 +965,9 @@ func (m *nfdWorker) updateNodeFeatureObject(labels Labels) error {
 		return fmt.Errorf("failed to get NodeFeature object: %w", err)
 	} else {
 		nfrUpdated := nfr.DeepCopy()
-		nfrUpdated.Annotations = map[string]string{nfdv1alpha1.WorkerVersionAnnotation: version.Get()}
+		nfrUpdated.Annotations = annotations
 		nfrUpdated.Labels = map[string]string{nfdv1alpha1.NodeFeatureObjNodeNameLabel: nodename}
+		nfrUpdated.OwnerReferences = m.ownerReference
 		nfrUpdated.Spec = nfdv1alpha1.NodeFeatureSpec{
 			Features: *features,
 			Labels:   labels,
@@ -729,12 +988,12 @@ func (m *nfdWorker) updateNodeFeatureObject(labels Labels) error {
 }
 
 // getNfdClient returns the clientset for using the nfd CRD api
-func (m *nfdWorker) getNfdClient() (*nfdclient.Clientset, error) {
+func (m *nfdWorker) getNfdClient() (nfdclient.Interface, error) {
 	if m.nfdClient != nil {
 		return m.nfdClient, nil
 	}
 
-	kubeconfig, err := apihelper.GetKubeconfig(m.args.Kubeconfig)
+	kubeconfig, err := utils.GetKubeconfig(m.args.Kubeconfig)
 	if err != nil {
 		return nil, err
 	}

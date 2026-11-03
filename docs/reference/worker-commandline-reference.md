@@ -30,6 +30,17 @@ Print usage and exit.
 
 Print version and exit.
 
+### -feature-gates
+
+The `-feature-gates` flag is used to enable or disable non GA features.
+The list of available feature gates can be found in the [feature gates documentation](feature-gates.md).
+
+Example:
+
+```bash
+nfd-worker -feature-gates NodeFeatureGroupAPI=true
+```
+
 ### -config
 
 The `-config` flag specifies the path of the nfd-worker configuration file to
@@ -58,90 +69,12 @@ Example:
 nfd-worker -options='{"sources":{"cpu":{"cpuid":{"attributeWhitelist":["AVX","AVX2"]}}}}'
 ```
 
-### -server
-
-> **NOTE** the gRPC API is deprecated and will be removed in a future release.
-> and this flag will be removed as well.
-
-The `-server` flag specifies the address of the nfd-master endpoint where to
-connect to.
-
-Default: localhost:8080
-
-Example:
-
-```bash
-nfd-worker -server=nfd-master.nfd.svc.cluster.local:443
-```
-
-### -ca-file
-
-> **NOTE** the gRPC API is deprecated and will be removed in a future release.
-> and this flag will be removed as well.
-
-The `-ca-file` is one of the three flags (together with `-cert-file` and
-`-key-file`) controlling the mutual TLS authentication on the worker side.
-This flag specifies the TLS root certificate that is used for verifying the
-authenticity of nfd-master.
-
-Default: *empty*
-
-> **NOTE:** Must be specified together with `-cert-file` and `-key-file`
-
-Example:
-
-```bash
-nfd-worker -ca-file=/opt/nfd/ca.crt -cert-file=/opt/nfd/worker.crt -key-file=/opt/nfd/worker.key
-```
-
-### -cert-file
-
-> **NOTE** the gRPC API is deprecated and will be removed in a future release.
-> and this flag will be removed as well.
-
-The `-cert-file` is one of the three flags (together with `-ca-file` and
-`-key-file`) controlling mutual TLS authentication on the worker side. This
-flag specifies the TLS certificate presented for authenticating outgoing
-requests.
-
-Default: *empty*
-
-> **NOTE:** Must be specified together with `-ca-file` and `-key-file`
-
-Example:
-
-```bash
-nfd-workerr -cert-file=/opt/nfd/worker.crt -key-file=/opt/nfd/worker.key -ca-file=/opt/nfd/ca.crt
-```
-
-### -key-file
-
-> **NOTE** the gRPC API is deprecated and will be removed in a future release.
-> and this flag will be removed as well.
-
-The `-key-file` is one of the three flags (together with `-ca-file` and
-`-cert-file`) controlling the mutual TLS authentication on the worker side.
-This flag specifies the private key corresponding the given certificate file
-(`-cert-file`) that is used for authenticating outgoing requests.
-
-Default: *empty*
-
-> **NOTE:** Must be specified together with `-cert-file` and `-ca-file`
-
-Example:
-
-```bash
-nfd-worker -key-file=/opt/nfd/worker.key -cert-file=/opt/nfd/worker.crt -ca-file=/opt/nfd/ca.crt
-```
-
 ### -kubeconfig
 
 The `-kubeconfig` flag specifies the kubeconfig to use for connecting to the
-Kubernetes API server. It is only needed for manipulating
-[NodeFeature](../usage/custom-resources.md#nodefeature) objects, and thus the flag
-only takes effect when
-[`-enable-nodefeature-api`](#-enable-nodefeature-api)) is specified. An empty
-value (which is also the default) implies in-cluster kubeconfig.
+Kubernetes API server. It is needed for manipulating
+[NodeFeature](../usage/custom-resources.md#nodefeature) objects. An empty value
+(which is also the default) implies in-cluster kubeconfig.
 
 Default: *empty*
 
@@ -151,27 +84,11 @@ Example:
 nfd-worker -kubeconfig ${HOME}/.kube/config
 ```
 
-### -server-name-override
-
-> **NOTE** the gRPC API is deprecated and will be removed in a future release.
-> and this flag will be removed as well.
-
-The `-server-name-override` flag specifies the common name (CN) which to
-expect from the nfd-master TLS certificate. This flag is mostly intended for
-development and debugging purposes.
-
-Default: *empty*
-
-Example:
-
-```bash
-nfd-worker -server-name-override=localhost
-```
-
 ### -feature-sources
 
 The `-feature-sources` flag specifies a comma-separated list of enabled feature
-sources. A special value `all` enables all sources. Prefixing a source name
+sources. A special value `all` enables all sources except
+[`fake`](worker-configuration-reference.md#sourcesfake). Prefixing a source name
 with `-` indicates that the source will be disabled instead - this is only
 meaningful when used in conjunction with `all`. This command line flag allows
 completely disabling the feature detection so that neither standard feature
@@ -193,7 +110,8 @@ nfd-worker -feature-sources=all,-pci
 ### -label-sources
 
 The `-label-sources` flag specifies a comma-separated list of enabled label
-sources. A special value `all` enables all sources. Prefixing a source name
+sources. A special value `all` enables all sources except
+[`fake`](worker-configuration-reference.md#sourcesfake). Prefixing a source name
 with `-` indicates that the source will be disabled instead - this is only
 meaningful when used in conjunction with `all`. Consider using the
 `core.labelSources` config file option, instead, allowing dynamic
@@ -210,47 +128,51 @@ Example:
 nfd-worker -label-sources=kernel,system,local
 ```
 
-### -enable-nodefeature-api
+### -no-publish-features
 
-> **NOTE** the gRPC API is deprecated and will be removed in a future release.
-> and this flag will be removed as well.
+The `-no-publish-features` flag specifies a comma-separated list of feature keys
+that are discovered but omitted from the published `NodeFeature` object, to
+reduce its size. Each entry matches the `<source>.<feature>` key exactly, or as
+a prefix when it ends with `*`. Discovery is not affected, so the features stay
+available to label sources and inline custom rules. Consider using the
+`core.noPublishFeatures` config file option, instead, allowing dynamic
+configurability.
 
-The `-enable-nodefeature-api` flag enables/disables the
-[NodeFeature](../usage/custom-resources.md#nodefeature) CRD API
-for communicating with nfd-master. When enabled nfd-worker creates per-node
-NodeFeature objects the contain all discovered node features and the set of
-feature labels to be created. Setting the flag to false will enable
-gRPC communication to nfd-master.
+> **NOTE:** This flag takes precedence over the `core.noPublishFeatures`
+> configuration file option. Only use it for features that no cluster-side
+> `NodeFeatureRule` or `NodeFeatureGroup` consumes.
 
-Default: true
+Default: *empty*
 
 Example:
 
 ```bash
-nfd-worker -enable-nodefeature-api=false
+nfd-worker -no-publish-features=pci.device,usb.*
 ```
 
-### -metrics
+### -port
 
-The `-metrics` flag specifies the port on which to expose
-[Prometheus](https://prometheus.io/) metrics. Setting this to 0 disables the
-metrics server on nfd-worker.
+The `-port` flag specifies the port on which metrics and healthz endpoints are
+served on.
 
-Default: 8081
+Default: 8080
 
 Example:
 
 ```bash
-nfd-worker -metrics=12345
+nfd-worker -port=12345
 ```
 
 ### -no-publish
 
-The `-no-publish` flag disables all communication with the nfd-master and the
-Kubernetes API server. It is effectively a "dry-run" flag for nfd-worker.
-NFD-Worker runs feature detection normally, but no labeling requests are sent
-to nfd-master and no NodeFeature objects are created or updated in the API
-server.
+The `-no-publish` flag disables publishing of the discovered features. It is
+effectively a "dry-run" flag for nfd-worker: NFD-Worker runs feature detection
+normally, but no NodeFeature objects are created or updated in the API server.
+nfd-worker still needs a Kubernetes client configuration (in-cluster
+configuration or `-kubeconfig`). It also still queries the API server to
+resolve owner references: with the default `-owner-refs=pod,ds` it reads its
+own Pod when `POD_NAME` is set (as in the DaemonSet), and with `node` it reads
+its Node. Use `-owner-refs=` to make no API server requests at all.
 
 > **NOTE:** This flag takes precedence over the
 > [`core.noPublish`](worker-configuration-reference.md#corenopublish)
@@ -262,6 +184,59 @@ Example:
 
 ```bash
 nfd-worker -no-publish
+```
+
+### -owner-refs
+
+The `-owner-refs` flag selects the objects referenced as owners of the
+NodeFeature object. It accepts a comma-separated list containing `node`, `pod`
+and/or `ds`. An explicitly empty value disables owner references.
+
+The owners have different lifecycle semantics:
+
+- `node` ties the NodeFeature to the UID of the current Node.
+- `pod` ties it to the UID of the nfd-worker Pod.
+- `ds` ties it to the DaemonSet that owns the nfd-worker Pod.
+
+When multiple owners are configured, Kubernetes keeps the NodeFeature while at
+least one owner still exists. For example, `node,ds` does not cause native
+garbage collection on a Node rebuild while the DaemonSet exists.
+
+Selecting `node` requires the worker service account to have `get` permission
+for Nodes. The Helm chart creates this permission when `worker.ownerRefs`
+contains `node`. Kustomize installations must include the
+[`worker-node-rbac`](https://github.com/kubernetes-sigs/node-feature-discovery/tree/{{site.release}}/deployment/components/worker-node-rbac)
+component. The NFD garbage collector may still explicitly delete stale
+NodeFeature objects independently of native owner-reference garbage collection.
+
+> **NOTE:** This flag takes precedence over the
+> [`core.ownerRefs`](worker-configuration-reference.md#coreownerrefs)
+> configuration file option.
+
+Default: `pod,ds`
+
+Example:
+
+```bash
+nfd-worker -owner-refs=node
+```
+
+### -no-owner-refs
+
+The `-no-owner-refs` flag disables setting owner references on the NodeFeature
+object. It takes precedence over `-owner-refs`. It is deprecated; use
+`-owner-refs=` instead.
+
+> **NOTE:** This flag takes precedence over the
+> [`core.noOwnerRefs`](worker-configuration-reference.md#corenoownerrefs)
+> configuration file option.
+
+Default: *false*
+
+Example:
+
+```bash
+nfd-worker -no-owner-refs
 ```
 
 ### -oneshot
@@ -298,6 +273,20 @@ Log to standard error as well as files.
 
 Default: false
 
+#### -alsologtostderrthreshold
+
+Logs at or above this threshold go to stderr when -alsologtostderr=true (no
+effect when -logtostderr=true).
+
+Default: 0
+
+#### -legacy_stderr_threshold_behavior
+
+If true, stderrthreshold is ignored when logtostderr=true (legacy behavior). If
+false, stderrthreshold is honored even when logtostderr=true.
+
+Default: true
+
 #### -log_backtrace_at
 
 When logging hits line file:N, emit a stack trace.
@@ -328,6 +317,13 @@ Default: 1800
 Log to standard error instead of files
 
 Default: true
+
+#### -one_output
+
+If true, only write logs to their native severity level (vs also writing to
+each lower severity level; no effect when -logtostderr=true).
+
+Default: false
 
 #### -skip_headers
 

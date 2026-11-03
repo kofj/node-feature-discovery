@@ -24,7 +24,7 @@ import (
 
 	"k8s.io/klog/v2"
 
-	nfdv1alpha1 "sigs.k8s.io/node-feature-discovery/pkg/apis/nfd/v1alpha1"
+	nfdv1alpha1 "sigs.k8s.io/node-feature-discovery/api/nfd/v1alpha1"
 	"sigs.k8s.io/node-feature-discovery/pkg/utils/hostpath"
 )
 
@@ -36,7 +36,7 @@ var optionalDevAttrs = []string{"sriov_totalvfs", "iommu_group/type", "iommu/int
 func readSinglePciAttribute(devPath string, attrName string) (string, error) {
 	data, err := os.ReadFile(filepath.Join(devPath, attrName))
 	if err != nil {
-		return "", fmt.Errorf("failed to read device attribute %s: %v", attrName, err)
+		return "", fmt.Errorf("failed to read device attribute %s: %w", attrName, err)
 	}
 	// Strip whitespace and '0x' prefix
 	attrVal := strings.TrimSpace(strings.TrimPrefix(string(data), "0x"))
@@ -55,7 +55,7 @@ func readPciDevInfo(devPath string) (*nfdv1alpha1.InstanceFeature, error) {
 	for _, attr := range mandatoryDevAttrs {
 		attrVal, err := readSinglePciAttribute(devPath, attr)
 		if err != nil {
-			return nil, fmt.Errorf("failed to read device %s: %s", attr, err)
+			return nil, fmt.Errorf("failed to read device %s: %w", attr, err)
 		}
 		attrs[attr] = attrVal
 	}

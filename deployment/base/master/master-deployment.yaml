@@ -14,28 +14,35 @@ spec:
       labels:
         app: nfd-master
     spec:
-      serviceAccount: nfd-master
+      serviceAccountName: nfd-master
       enableServiceLinks: false
       tolerations: []
       containers:
         - name: nfd-master
           image: gcr.io/k8s-staging-nfd/node-feature-discovery:master
           imagePullPolicy: Always
+          env:
+          - name: GOMEMLIMIT
+            valueFrom:
+              resourceFieldRef:
+                resource: limits.memory
+          resources:
+            limits:
+              memory: 4Gi
+            requests:
+              cpu: 100m
+              memory: 128Mi
           livenessProbe:
-            exec:
-              command: ["/usr/bin/grpc_health_probe", "-addr=:8080"]
-            initialDelaySeconds: 10
-            periodSeconds: 10
+            httpGet:
+              path: /healthz
+              port: http
           readinessProbe:
-            exec:
-              command: ["/usr/bin/grpc_health_probe", "-addr=:8080"]
-            initialDelaySeconds: 5
-            periodSeconds: 10
+            httpGet:
+              path: /healthz
+              port: http
             failureThreshold: 10
           command:
             - "nfd-master"
           ports:
-            - name: metrics
-              containerPort: 8081
-            - name: grpc
+            - name: http
               containerPort: 8080

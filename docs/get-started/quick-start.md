@@ -6,35 +6,48 @@ sort: 2
 
 # Quick start
 
-Minimal steps to deploy latest released version of NFD in your cluster.
+Minimal steps to deploy NFD {{ site.release }} in your cluster. On the `master`
+documentation the commands install a development build from the master branch,
+not a release.
 
 ## Installation
 
-Deploy with kustomize -- creates a new namespace, service and required RBAC
-rules and deploys nfd-master and nfd-worker daemons.
+NFD installation consists of CRDs, RBAC rules, Deployments of the nfd-master
+and nfd-gc daemons and DaemonSet of the nfd-worker daemon.
+
+### Helm
 
 ```bash
-kubectl apply -k https://github.com/kubernetes-sigs/node-feature-discovery/deployment/overlays/default?ref={{ site.release }}
+helm install -n node-feature-discovery --create-namespace nfd {{ site.helm_oci_repo }} --version {{ site.helm_chart_version }}
+```
+
+### Kustomize
+
+Alternatively, NFD can be deployed with kubectl/kustomize.
+
+```bash
+kubectl apply -k "https://github.com/kubernetes-sigs/node-feature-discovery/deployment/overlays/default?ref={{ site.release }}"
 ```
 
 ## Verify
 
-Wait until NFD master and NFD worker are running.
+Wait until NFD pods are running.
 
 ```bash
 $ kubectl -n node-feature-discovery get ds,deploy
-NAME                         DESIRED   CURRENT   READY   UP-TO-DATE   AVAILABLE   NODE SELECTOR   AGE
-daemonset.apps/nfd-worker    2         2         2       2            2           <none>          10s
+NAME                                               DESIRED   CURRENT   READY   UP-TO-DATE   AVAILABLE   NODE SELECTOR   AGE
+daemonset.apps/nfd-node-feature-discovery-worker   2         2         2       2            2           <none>          20s
 
-NAME                         READY   UP-TO-DATE   AVAILABLE   AGE
-deployment.apps/nfd-master   1/1     1            1           17s
+NAME                                                READY   UP-TO-DATE   AVAILABLE   AGE
+deployment.apps/nfd-node-feature-discovery-gc       1/1     1            1           20s
+deployment.apps/nfd-node-feature-discovery-master   1/1     1            1           20s
 
 ```
 
 Check that NFD feature labels have been created
 
 ```bash
-$ kubectl get no -o json | jq '.items[].metadata.labels'
+$ kubectl get no -o json | jq ".items[].metadata.labels"
 {
   "kubernetes.io/arch": "amd64",
   "kubernetes.io/os": "linux",
@@ -78,11 +91,22 @@ feature-dependent-pod   1/1     Running   0          23s   10.36.0.4   node-2   
 
 ### Deploy nfd-topology-updater
 
-In order to deploy nfd-topology-updater use the `topologyupdater` kustomize
-overlay.
+#### Deploy nfd-topology-updater with Helm
 
 ```bash
-kubectl apply -k https://github.com/kubernetes-sigs/node-feature-discovery/deployment/overlays/topologyupdater?ref={{ site.release }}
+helm upgrade --install -n node-feature-discovery --create-namespace nfd {{ site.helm_oci_repo }} --version {{ site.helm_chart_version }} --set topologyUpdater.enable=true --set topologyUpdater.createCRDs=true
+```
+
+`topologyUpdater.createCRDs=true` installs the NodeResourceTopology CRD. Omit it
+only if the CRD is already installed in the cluster.
+
+#### Deploy nfd-topology-updater with Kustomize
+
+There's a separate overlay that deploys nfd-topology-updater in addition to the
+default NFD components.
+
+```bash
+kubectl apply -k "https://github.com/kubernetes-sigs/node-feature-discovery/deployment/overlays/topologyupdater?ref={{ site.release }}"
 ```
 
 ### Verify nfd-topology-updater
@@ -91,10 +115,12 @@ Wait until nfd-topology-updater is running.
 
 ```bash
 $ kubectl -n node-feature-discovery get ds
-NAME                                  DESIRED   CURRENT   READY   UP-TO-DATE   AVAILABLE   NODE SELECTOR   AGE
-daemonset.apps/nfd-topology-updater   2         2         2       2            2           <none>          5s
-
+NAME                                          DESIRED   CURRENT   READY   UP-TO-DATE   AVAILABLE   NODE SELECTOR   AGE
+nfd-node-feature-discovery-topology-updater   2         2         2       2            2           <none>          20s
+...
 ```
+
+(With the kustomize overlay the DaemonSet is named `nfd-topology-updater`.)
 
 Check that the NodeResourceTopology objects are created
 

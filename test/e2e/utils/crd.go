@@ -32,9 +32,9 @@ import (
 	apiruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes/scheme"
-	nfdv1alpha1 "sigs.k8s.io/node-feature-discovery/pkg/apis/nfd/v1alpha1"
-	nfdclientset "sigs.k8s.io/node-feature-discovery/pkg/generated/clientset/versioned"
-	nfdscheme "sigs.k8s.io/node-feature-discovery/pkg/generated/clientset/versioned/scheme"
+	nfdclientset "sigs.k8s.io/node-feature-discovery/api/generated/clientset/versioned"
+	nfdscheme "sigs.k8s.io/node-feature-discovery/api/generated/clientset/versioned/scheme"
+	nfdv1alpha1 "sigs.k8s.io/node-feature-discovery/api/nfd/v1alpha1"
 )
 
 var packagePath string
@@ -123,6 +123,21 @@ func CreateNodeFeatureRulesFromFile(ctx context.Context, cli nfdclientset.Interf
 	return nil
 }
 
+// CreateNodeFeatureGroupsFromFile creates a NodeFeatureGroup object from a given file located under test data directory.
+func CreateNodeFeatureGroupsFromFile(ctx context.Context, cli nfdclientset.Interface, namespace, filename string) error {
+	objs, err := nodeFeatureGroupsFromFile(filepath.Join(packagePath, "..", "data", filename))
+	if err != nil {
+		return err
+	}
+
+	for _, obj := range objs {
+		if _, err = cli.NfdV1alpha1().NodeFeatureGroups(namespace).Create(ctx, obj, metav1.CreateOptions{}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // UpdateNodeFeatureRulesFromFile updates existing NodeFeatureRule object from a given file located under test data directory.
 func UpdateNodeFeatureRulesFromFile(ctx context.Context, cli nfdclientset.Interface, filename string) error {
 	objs, err := nodeFeatureRulesFromFile(filepath.Join(packagePath, "..", "data", filename))
@@ -147,10 +162,8 @@ func UpdateNodeFeatureRulesFromFile(ctx context.Context, cli nfdclientset.Interf
 // CreateNodeFeature creates a dummy NodeFeature object for a node
 func CreateNodeFeature(ctx context.Context, cli nfdclientset.Interface, namespace, name, nodeName string) error {
 	nr := &nfdv1alpha1.NodeFeature{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:   name,
-			Labels: map[string]string{nfdv1alpha1.NodeFeatureObjNodeNameLabel: nodeName},
-		},
+		Name:   name,
+		Labels: map[string]string{nfdv1alpha1.NodeFeatureObjNodeNameLabel: nodeName},
 	}
 	_, err := cli.NfdV1alpha1().NodeFeatures(namespace).Create(ctx, nr, metav1.CreateOptions{})
 	return err
@@ -230,6 +243,25 @@ func nodeFeatureRulesFromFile(path string) ([]*nfdv1alpha1.NodeFeatureRule, erro
 	for i, obj := range objs {
 		var ok bool
 		crs[i], ok = obj.(*nfdv1alpha1.NodeFeatureRule)
+		if !ok {
+			return nil, fmt.Errorf("unexpected type %t when reading %q", obj, path)
+		}
+	}
+
+	return crs, nil
+}
+
+func nodeFeatureGroupsFromFile(path string) ([]*nfdv1alpha1.NodeFeatureGroup, error) {
+	objs, err := apiObjsFromFile(path, nfdscheme.Codecs.UniversalDeserializer())
+	if err != nil {
+		return nil, err
+	}
+
+	crs := make([]*nfdv1alpha1.NodeFeatureGroup, len(objs))
+
+	for i, obj := range objs {
+		var ok bool
+		crs[i], ok = obj.(*nfdv1alpha1.NodeFeatureGroup)
 		if !ok {
 			return nil, fmt.Errorf("unexpected type %t when reading %q", obj, path)
 		}

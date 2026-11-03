@@ -15,31 +15,30 @@ sort: 2
 
 ---
 
-[Kustomize](https://github.com/kubernetes-sigs/kustomize) provides easy
-deployment of NFD. Customization of the deployment is done by maintaining
+[Kustomize](https://github.com/kubernetes-sigs/kustomize) can be used to
+deploy NFD. Customization of the deployment is done by maintaining
 declarative overlays on top of the base overlays in NFD.
 
 To follow the deployment instructions here,
-[kubectl](https://kubernetes.io/docs/tasks/tools/install-kubectl) v1.21 or
+[kubectl](https://kubernetes.io/docs/tasks/tools/install-kubectl) v1.24 or
 later is required.
 
 The kustomize overlays provided in the repo can be used directly:
 
 ```bash
-kubectl apply -k https://github.com/kubernetes-sigs/node-feature-discovery/deployment/overlays/default?ref={{ site.release }}
+kubectl apply -k "https://github.com/kubernetes-sigs/node-feature-discovery/deployment/overlays/default?ref={{ site.release }}"
 ```
 
 This will required RBAC rules and deploy nfd-master (as a deployment) and
 nfd-worker (as daemonset) in the `node-feature-discovery` namespace.
 
 > **NOTE:** nfd-topology-updater is not deployed as part of the `default`
-> overlay.  Please refer to the [Master Worker Topologyupdater](#master-worker-topologyupdater)
+> overlay. Refer to the [Master Worker Topologyupdater](#master-worker-topologyupdater)
 > and [Topologyupdater](#topologyupdater) below.
 
 Alternatively you can clone the repository and customize the deployment by
-creating your own overlays. For example, to deploy the
-[minimal](image-variants.md#minimal) image. See [kustomize][kustomize] for more
-information about managing deployment configurations.
+creating your own overlays. See [kustomize][kustomize] for more information
+about managing deployment configurations.
 
 ## Overlays
 
@@ -49,46 +48,22 @@ scenarios under
 
 - [`default`](https://github.com/kubernetes-sigs/node-feature-discovery/blob/{{site.release}}/deployment/overlays/default):
   default deployment of nfd-worker as a daemonset, described above
-- [`default-combined`](https://github.com/kubernetes-sigs/node-feature-discovery/blob/{{site.release}}/deployment/overlays/default-combined)
-  see [Master-worker pod](#master-worker-pod) below
 - [`default-job`](https://github.com/kubernetes-sigs/node-feature-discovery/blob/{{site.release}}/deployment/overlays/default-job):
   see [Worker one-shot](#worker-one-shot) below
 - [`master-worker-topologyupdater`](https://github.com/kubernetes-sigs/node-feature-discovery/blob/{{site.release}}/deployment/overlays/master-worker-topologyupdater):
   see [Master Worker Topologyupdater](#master-worker-topologyupdater) below
 - [`topologyupdater`](https://github.com/kubernetes-sigs/node-feature-discovery/blob/{{site.release}}/deployment/overlays/topologyupdater):
   see [Topology Updater](#topologyupdater) below
-- [`Metrics`](https://github.com/kubernetes-sigs/node-feature-discovery/blob/{{site.release}}/deployment/overlays/prometheus):
+- [`prometheus`](https://github.com/kubernetes-sigs/node-feature-discovery/blob/{{site.release}}/deployment/overlays/prometheus):
   see [Metrics](#metrics) below
 - [`prune`](https://github.com/kubernetes-sigs/node-feature-discovery/blob/{{site.release}}/deployment/overlays/prune):
   clean up the cluster after uninstallation, see
   [Removing feature labels](uninstallation.md#removing-feature-labels)
-- [`samples/cert-manager`](https://github.com/kubernetes-sigs/node-feature-discovery/blob/{{site.release}}/deployment/overlays/samples/cert-manager):
-  an example for supplementing the default deployment with cert-manager for TLS
-  authentication, see
-  [Automated TLS certificate management using cert-manager](tls.md)
-  for details
 - [`samples/custom-rules`](https://github.com/kubernetes-sigs/node-feature-discovery/blob/{{site.release}}/deployment/overlays/samples/custom-rules):
   an example for spicing up the default deployment with a separately managed
   configmap of custom labeling rules, see
   [Custom feature source](../usage/features.md#custom) for more information about
   custom node labels
-
-### Master-worker pod
-
-You can also run nfd-master and nfd-worker inside the same pod
-
-```bash
-kubectl apply -k https://github.com/kubernetes-sigs/node-feature-discovery/deployment/overlays/default-combined?ref={{ site.release }}
-
-```
-
-This creates a DaemonSet that runs nfd-worker and nfd-master in the same Pod.
-In this case no nfd-master is run on the master node(s), but, the worker nodes
-are able to label themselves which may be desirable e.g. in single-node setups.
-
-> **NOTE:** nfd-topology-updater is not deployed by the default-combined
-> overlay.  To enable nfd-topology-updater in this scenario,the users must
-> customize the deployment themselves.
 
 ### Worker one-shot
 
@@ -97,12 +72,14 @@ The `default-job` overlay may be used to achieve this:
 
 ```bash
 NUM_NODES=$(kubectl get no -o jsonpath='{.items[*].metadata.name}' | wc -w)
-kubectl kustomize https://github.com/kubernetes-sigs/node-feature-discovery/deployment/overlays/default-job?ref={{ site.release }} | \
+kubectl kustomize "https://github.com/kubernetes-sigs/node-feature-discovery/deployment/overlays/default-job?ref={{ site.release }}" | \
     sed s"/NUM_NODES/$NUM_NODES/" | \
     kubectl apply -f -
 ```
 
-The example above launches as many jobs as there are non-master nodes. Note that
+The example above creates one Job that runs as many worker pods as there are
+nodes in the cluster (including control-plane nodes, which only get a pod if
+they are not tainted). Note that
 this approach does not guarantee running once on every node. For example,
 tainted, non-ready nodes or some other reasons in Job scheduling may cause some
 node(s) will run extra job instance(s) to satisfy the request.
@@ -114,17 +91,17 @@ deployed as separate pods. The `master-worker-topologyupdater` overlay may be
 used to achieve this:
 
 ```bash
-kubectl apply -k https://github.com/kubernetes-sigs/node-feature-discovery/deployment/overlays/master-worker-topologyupdater?ref={{ site.release }}
+kubectl apply -k "https://github.com/kubernetes-sigs/node-feature-discovery/deployment/overlays/master-worker-topologyupdater?ref={{ site.release }}"
 
 ```
 
 ### Topologyupdater
 
-In order to deploy just nfd-topology-updater (without nfd-master and nfd-worker)
+To deploy just nfd-topology-updater (without nfd-master and nfd-worker)
 use the `topologyupdater` overlay:
 
 ```bash
-kubectl apply -k https://github.com/kubernetes-sigs/node-feature-discovery/deployment/overlays/topologyupdater?ref={{ site.release }}
+kubectl apply -k "https://github.com/kubernetes-sigs/node-feature-discovery/deployment/overlays/topologyupdater?ref={{ site.release }}"
 
 ```
 
@@ -134,8 +111,8 @@ are deployed as separate pods;
 
 ```bash
 
-kubectl apply -k https://github.com/kubernetes-sigs/node-feature-discovery/deployment/overlays/default?ref={{ site.release }}
-kubectl apply -k https://github.com/kubernetes-sigs/node-feature-discovery/deployment/overlays/topologyupdater?ref={{ site.release }}
+kubectl apply -k "https://github.com/kubernetes-sigs/node-feature-discovery/deployment/overlays/default?ref={{ site.release }}"
+kubectl apply -k "https://github.com/kubernetes-sigs/node-feature-discovery/deployment/overlays/topologyupdater?ref={{ site.release }}"
 
 ```
 
@@ -146,8 +123,8 @@ to scrape metrics from node-feature-discovery,
 run the following command:
 
 ```bash
-kubectl apply -k https://github.com/kubernetes-sigs/node-feature-discovery/deployment/overlays/default?ref={{ site.release }}
-kubectl apply -k https://github.com/kubernetes-sigs/node-feature-discovery/deployment/overlays/prometheus?ref={{ site.release }}
+kubectl apply -k "https://github.com/kubernetes-sigs/node-feature-discovery/deployment/overlays/default?ref={{ site.release }}"
+kubectl apply -k "https://github.com/kubernetes-sigs/node-feature-discovery/deployment/overlays/prometheus?ref={{ site.release }}"
 ```
 
 ## Uninstallation
@@ -157,21 +134,24 @@ deployment.  Beware that this will also delete the namespace that NFD is
 running in. For example, in case the default overlay from the repo was used:
 
 ```bash
-kubectl delete -k https://github.com/kubernetes-sigs/node-feature-discovery/deployment/overlays/default?ref={{ site.release }}
+kubectl delete -k "https://github.com/kubernetes-sigs/node-feature-discovery/deployment/overlays/default?ref={{ site.release }}"
 ```
 
-Alternatively you can delete create objects one-by-one, depending on the type
-of deployment, for example:
+Alternatively you can delete created objects one-by-one, depending on the type
+of deployment, for example (default overlay):
 
 ```bash
 NFD_NS=node-feature-discovery
 kubectl -n $NFD_NS delete ds nfd-worker
-kubectl -n $NFD_NS delete deploy nfd-master
-kubectl -n $NFD_NS delete svc nfd-master
-kubectl -n $NFD_NS delete sa nfd-master
-kubectl delete clusterrole nfd-master
-kubectl delete clusterrolebinding nfd-master
+kubectl -n $NFD_NS delete deploy nfd-master nfd-gc
+kubectl -n $NFD_NS delete sa nfd-master nfd-worker nfd-gc
+kubectl -n $NFD_NS delete role,rolebinding nfd-worker
+kubectl delete clusterrole nfd-master nfd-gc
+kubectl delete clusterrolebinding nfd-master nfd-gc
 ```
+
+This leaves the nfd-master and nfd-worker ConfigMaps (their names have a hash
+suffix), the NFD CRDs and the namespace in place.
 
 <!-- Links -->
 [kustomize]: https://github.com/kubernetes-sigs/kustomize

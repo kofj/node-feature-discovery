@@ -1,8 +1,12 @@
 # -*- mode: Python -*-
+# Anonymous, ephemeral image registry.
+default_registry('ttl.sh')
+# Allow Tilt to use the local Docker daemon
+allow_k8s_contexts('kubernetes-admin@kubernetes')
 
 BASE_IMAGE_MINIMAL="gcr.io/distroless/base"
 BASE_IMAGE_FULL="debian:bullseye-slim"
-BUILDER_IMAGE="golang:1.19-bullseye"
+BUILDER_IMAGE="golang:1.27-trixie"
 HOSTMOUNT_PREFIX="/host-"
 IMAGE_TAG_NAME = os.getenv('IMAGE_TAG_NAME', "master")
 IMAGE_REGISTRY = os.getenv('IMAGE_REGISTRY', "gcr.io/k8s-staging-nfd")

@@ -1,7 +1,7 @@
 ---
 title: "Versions"
 layout: default
-sort: 8
+sort: 10
 ---
 
 # Versions and deprecation
@@ -37,3 +37,7 @@ in **X+2**.
 
 The same policy (support for 1 release after deprecation) also applies to Helm
 chart parameters.
+
+## Kubernetes compatibility
+
+Node Feature Discovery is compatible with Kubernetes v1.24 and later.
